@@ -29,7 +29,7 @@ export function SummaryModelSettings({ refetchTrigger }: SummaryModelSettingsPro
       const data = await invoke('api_get_model_config') as any;
       if (data && data.provider !== null) {
         // Fetch API key if not included and provider requires it
-        if (data.provider !== 'ollama' && data.provider !== 'builtin-ai' && !data.apiKey) {
+        if (data.provider !== 'ollama' && data.provider !== 'builtin-ai' && data.provider !== 'openai-chatgpt' && !data.apiKey) {
           try {
             const apiKeyData = await invoke('api_get_api_key', {
               provider: data.provider
@@ -101,19 +101,22 @@ export function SummaryModelSettings({ refetchTrigger }: SummaryModelSettingsPro
   // Save handler
   const handleSaveModelConfig = async (config: ModelConfig) => {
     try {
+      const savedConfig = config.provider === 'openai-chatgpt'
+        ? { ...config, apiKey: null, customOpenAIApiKey: null }
+        : config;
       await invoke('api_save_model_config', {
-        provider: config.provider,
-        model: config.model,
-        whisperModel: config.whisperModel,
-        apiKey: config.apiKey,
-        ollamaEndpoint: config.ollamaEndpoint,
+        provider: savedConfig.provider,
+        model: savedConfig.model,
+        whisperModel: savedConfig.whisperModel,
+        apiKey: savedConfig.apiKey,
+        ollamaEndpoint: savedConfig.ollamaEndpoint,
       });
 
-      setModelConfig(config);
+      setModelConfig(savedConfig);
 
       // Emit event to sync other components
       const { emit } = await import('@tauri-apps/api/event');
-      await emit('model-config-updated', config);
+      await emit('model-config-updated', savedConfig);
 
       toast.success('Model settings saved successfully');
     } catch (error) {

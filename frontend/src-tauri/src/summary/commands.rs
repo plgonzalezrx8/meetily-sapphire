@@ -10,6 +10,7 @@ use crate::summary::metadata::{
 use crate::summary::language_detection::{
     detect_summary_language, SummaryLanguageDetection,
 };
+use crate::summary::llm_client::LLMProvider;
 use crate::summary::processor::{clean_llm_markdown_detailed, contains_reasoning_marker};
 use crate::summary::service::SummaryService;
 use log::{error as log_error, info as log_info, warn as log_warn};
@@ -24,6 +25,18 @@ static SUMMARY_START_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 static LAST_SUMMARY_START: LazyLock<Mutex<Option<DateTime<Utc>>>> =
     LazyLock::new(|| Mutex::new(None));
+
+fn chatgpt_automatic_intent(provider: &str, origin: Option<&str>) -> Result<Option<bool>, String> {
+    if LLMProvider::from_str(provider) != Ok(LLMProvider::OpenAiChatGpt) {
+        return Ok(None);
+    }
+    match origin {
+        Some("manual") => Ok(Some(false)),
+        Some("automatic") => Ok(Some(true)),
+        _ => Err("ChatGPT summary origin must be manual or automatic".to_string()),
+    }
+}
+
 fn next_summary_start(now: DateTime<Utc>) -> DateTime<Utc> {
     let mut last = LAST_SUMMARY_START
         .lock()
@@ -471,9 +484,16 @@ pub async fn api_process_transcript<R: Runtime>(
     custom_prompt: Option<String>,
     template_id: Option<String>,
     summary_language: Option<String>,
+    origin: Option<String>,
     _auth_token: Option<String>,
 ) -> Result<ProcessTranscriptResponse, String> {
     use uuid::Uuid;
+
+    // Bind this whole summary to one account before creating or replacing a process.
+    let chatgpt_permit = match chatgpt_automatic_intent(&model, origin.as_deref())? {
+        Some(automatic) => Some(crate::chatgpt::session::acquire(automatic).await?),
+        None => None,
+    };
 
     let m_id = meeting_id.unwrap_or_else(|| format!("meeting-{}", Uuid::new_v4()));
     log_info!(
@@ -539,6 +559,7 @@ pub async fn api_process_transcript<R: Runtime>(
             final_prompt,
             final_template_id,
             summary_language,
+            chatgpt_permit,
         )
         .await;
     });
@@ -606,6 +627,15 @@ pub async fn api_cancel_summary<R: Runtime>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn chatgpt_requires_explicit_summary_origin() {
+        assert_eq!(chatgpt_automatic_intent("openai-chatgpt", Some("manual")), Ok(Some(false)));
+        assert_eq!(chatgpt_automatic_intent("OPENAI-CHATGPT", Some("automatic")), Ok(Some(true)));
+        assert!(chatgpt_automatic_intent("openai-chatgpt", None).is_err());
+        assert!(chatgpt_automatic_intent("openai-chatgpt", Some("background")).is_err());
+        assert_eq!(chatgpt_automatic_intent("openai", None), Ok(None));
+    }
 
     #[test]
     fn redacts_only_flagged_historical_reasoning() {

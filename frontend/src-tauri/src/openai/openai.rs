@@ -1,194 +1,293 @@
+use crate::provider_catalog::{recommended_models, ModelCache};
+use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::collections::HashSet;
+use std::time::Duration;
 use tauri::command;
 
-/// OpenAI model information returned to frontend
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OpenAIModel {
     pub id: String,
 }
 
-/// API response model from OpenAI
 #[derive(Debug, Deserialize)]
 struct OpenAIApiModel {
     id: String,
-    #[allow(dead_code)]
-    object: String,
-    #[allow(dead_code)]
-    owned_by: String,
 }
 
-/// API response wrapper from OpenAI
 #[derive(Debug, Deserialize)]
 struct OpenAIApiResponse {
     data: Vec<OpenAIApiModel>,
 }
 
-/// Cache entry for models
-struct CacheEntry {
-    models: Vec<OpenAIModel>,
-    fetched_at: Instant,
-}
+const MODELS_URL: &str = "https://api.openai.com/v1/models";
+static MODELS_CACHE: ModelCache<OpenAIModel> = ModelCache::new();
 
-/// Global cache for OpenAI models (5 minute TTL)
-static MODELS_CACHE: RwLock<Option<CacheEntry>> = RwLock::new(None);
-
-/// Cache TTL in seconds
-const CACHE_TTL_SECS: u64 = 300;
-
-/// Fallback models when API fetch fails (matches frontend hardcoded values)
-const FALLBACK_MODELS: &[&str] = &[
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-4o",
-    "gpt-4.1",
-    "gpt-4-turbo",
-    "gpt-3.5-turbo",
-    "gpt-4o-2024-11-20",
-    "gpt-4o-2024-08-06",
-    "gpt-4o-mini-2024-07-18",
-    "gpt-4.1-2025-04-14",
-    "gpt-4.1-nano-2025-04-14",
-    "gpt-4.1-mini-2025-04-14",
-    "o4-mini-2025-04-16",
-    "o3-2025-04-16",
-    "o3-mini-2025-01-31",
-    "o1-2024-12-17",
-    "o1-mini-2024-09-12",
-    "gpt-4-turbo-2024-04-09",
-    "gpt-4-0125-Preview",
-    "gpt-4-vision-preview",
-    "gpt-4-1106-Preview",
-    "gpt-3.5-turbo-0125",
-    "gpt-3.5-turbo-1106",
-];
-
-/// Get fallback models as OpenAIModel vec
-fn get_fallback_models() -> Vec<OpenAIModel> {
-    FALLBACK_MODELS
-        .iter()
-        .map(|id| OpenAIModel { id: id.to_string() })
-        .collect()
-}
-
-/// Check if model is a chat-capable model (filter out embedding, tts, etc.)
+// shortcut: IDs can misclassify capabilities, use API metadata if exposed.
 fn is_chat_model(model_id: &str) -> bool {
-    let id = model_id.to_lowercase();
-    // Include gpt-*, o1-*, o3-*, o4-* models
-    // Exclude embedding, tts, whisper, dall-e, babbage, davinci (non-chat models)
-    (id.starts_with("gpt-")
-        || id.starts_with("o1-")
-        || id.starts_with("o3-")
-        || id.starts_with("o4-")
-        || id.starts_with("chatgpt-"))
-        && !id.contains("embedding")
-        && !id.contains("tts")
-        && !id.contains("whisper")
-        && !id.contains("dall-e")
-        && !id.contains("babbage")
-        && !id.contains("davinci")
-        && !id.contains("instruct")
-        && !id.contains("realtime")
-        && !id.contains("audio")
+    let id = model_id.to_ascii_lowercase();
+    let id = id
+        .strip_prefix("ft:")
+        .and_then(|tuned| tuned.split(':').next())
+        .unwrap_or(&id);
+    let reasoning_model = id.strip_prefix('o').is_some_and(|suffix| {
+        let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && (digits == suffix.len() || suffix.as_bytes()[digits] == b'-')
+    });
+    let responses_only = [
+        "o1-pro",
+        "o3-pro",
+        "gpt-5-pro",
+        "gpt-5.2-pro",
+        "gpt-5.4-pro",
+        "gpt-5.5-pro",
+        "o3-deep-research",
+        "o4-mini-deep-research",
+    ]
+    .iter()
+    .any(|family| {
+        id == *family
+            || id
+                .strip_prefix(*family)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    });
+    (id.starts_with("gpt-") || id.starts_with("chatgpt-") || reasoning_model)
+        && !responses_only
+        && ![
+            "embedding",
+            "tts",
+            "whisper",
+            "dall-e",
+            "babbage",
+            "davinci",
+            "instruct",
+            "realtime",
+            "audio",
+            "transcribe",
+            "image",
+            "codex",
+        ]
+        .iter()
+        .any(|name| id.contains(name))
 }
 
-/// Fetch OpenAI models from API
-///
-/// # Arguments
-/// * `api_key` - OpenAI API key
-///
-/// # Returns
-/// Vector of available models, or fallback models on error
 #[command]
 pub async fn get_openai_models(api_key: Option<String>) -> Result<Vec<OpenAIModel>, String> {
-    // Return fallback if no API key provided
-    let api_key = match api_key {
-        Some(key) if !key.trim().is_empty() => key.trim().to_string(),
-        _ => {
-            log::info!("No OpenAI API key provided, returning fallback models");
-            return Ok(get_fallback_models());
-        }
-    };
+    fetch_models(api_key, MODELS_URL, &MODELS_CACHE).await
+}
 
-    // Check cache first
-    {
-        let cache = MODELS_CACHE.read().map_err(|e| e.to_string())?;
-        if let Some(entry) = cache.as_ref() {
-            if entry.fetched_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS) {
-                log::info!("Returning cached OpenAI models ({} models)", entry.models.len());
-                return Ok(entry.models.clone());
-            }
-        }
+async fn fetch_models(
+    api_key: Option<String>,
+    endpoint: &str,
+    cache: &ModelCache<OpenAIModel>,
+) -> Result<Vec<OpenAIModel>, String> {
+    let api_key = api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or("Enter an OpenAI API key to discover models.")?;
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
+        .map_err(|_| "The OpenAI API key contains invalid characters.")?;
+    authorization.set_sensitive(true);
+
+    if let Some(models) = cache.get(endpoint, api_key)? {
+        return Ok(models);
     }
 
-    // Fetch from API
-    log::info!("Fetching OpenAI models from API...");
-    let client = reqwest::Client::new();
-
-    let response = match client
-        .get("https://api.openai.com/v1/models")
-        .header("Authorization", format!("Bearer {}", api_key))
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "Could not initialize OpenAI model discovery.")?;
+    let response = client
+        .get(endpoint)
+        .header(AUTHORIZATION, authorization)
         .timeout(Duration::from_secs(5))
         .send()
         .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            log::warn!("Failed to fetch OpenAI models: {}. Using fallback.", e);
-            return Ok(get_fallback_models());
-        }
-    };
+        .map_err(|_| "Could not reach the OpenAI Models API. Check your connection.")?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        log::warn!(
-            "OpenAI API returned status {}. Using fallback models.",
-            status
-        );
-        return Ok(get_fallback_models());
+    match response.status().as_u16() {
+        401 | 403 => return Err("OpenAI rejected the API key or denied model access.".into()),
+        429 => {
+            return Err("OpenAI returned HTTP 429 (rate limit or quota). Try again later.".into())
+        }
+        status if !response.status().is_success() => {
+            return Err(format!("OpenAI model discovery failed (HTTP {status})."));
+        }
+        _ => {}
     }
 
-    let api_response: OpenAIApiResponse = match response.json().await {
-        Ok(data) => data,
-        Err(e) => {
-            log::warn!("Failed to parse OpenAI response: {}. Using fallback.", e);
-            return Ok(get_fallback_models());
+    let response: OpenAIApiResponse = response.json().await.map_err(|error| {
+        if error.is_decode() {
+            "OpenAI returned an invalid model list."
+        } else {
+            "Could not read the OpenAI model list. Check your connection."
         }
-    };
-
-    // Filter to only chat models and map to our struct
-    let models: Vec<OpenAIModel> = api_response
+    })?;
+    let mut seen = HashSet::new();
+    let mut models: Vec<OpenAIModel> = response
         .data
         .into_iter()
-        .filter(|m| is_chat_model(&m.id))
-        .map(|m| OpenAIModel { id: m.id })
+        .filter(|model| is_chat_model(&model.id) && seen.insert(model.id.clone()))
+        .map(|model| OpenAIModel { id: model.id })
         .collect();
-
-    // If no models returned (e.g., restricted API key), use fallback
-    if models.is_empty() {
-        log::warn!("No chat models returned from OpenAI API. Using fallback.");
-        return Ok(get_fallback_models());
-    }
-
-    log::info!("Fetched {} OpenAI models from API", models.len());
-
-    // Update cache
-    {
-        let mut cache = MODELS_CACHE.write().map_err(|e| e.to_string())?;
-        *cache = Some(CacheEntry {
-            models: models.clone(),
-            fetched_at: Instant::now(),
-        });
-    }
-
+    let recommended = recommended_models("openai");
+    models.sort_by_key(|model| {
+        recommended
+            .iter()
+            .position(|id| id == &model.id)
+            .unwrap_or(usize::MAX)
+    });
+    cache.store(endpoint, api_key, models.clone())?;
     Ok(models)
 }
 
-/// Clear the models cache (useful when API key changes)
 pub fn clear_cache() {
-    if let Ok(mut cache) = MODELS_CACHE.write() {
-        *cache = None;
-        log::info!("OpenAI models cache cleared");
+    MODELS_CACHE.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider_catalog::test_support::server;
+
+    fn ids(models: Vec<OpenAIModel>) -> Vec<String> {
+        models.into_iter().map(|model| model.id).collect()
+    }
+
+    #[tokio::test]
+    async fn discovery_is_key_scoped_and_orders_only_discovered_text_models() {
+        let (endpoint, requests, task) = server(|request| {
+            if request.contains("Bearer key-b") {
+                (200, r#"{"data":[{"id":"o3"}]}"#.into())
+            } else {
+                (200, r#"{"data":[{"id":"gpt-6.2-astra"},{"id":"gpt-6.2-sol"},{"id":"gpt-6-luna"},{"id":"gpt-4o-audio-preview"},{"id":"gpt-image-1"},{"id":"gpt-6-codex"},{"id":"o3-pro"},{"id":"gpt-5-pro-2025-10-06"},{"id":"o4-mini-deep-research"},{"id":"ft:gpt-4o:audio-lab:image"},{"id":"gpt-6-luna"}]}"#.into())
+            }
+        }).await;
+        let cache = ModelCache::new();
+        let first = || fetch_models(Some("key-a".into()), &endpoint, &cache);
+        assert_eq!(
+            ids(first().await.unwrap()),
+            [
+                "gpt-6-luna",
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
+                "ft:gpt-4o:audio-lab:image"
+            ]
+        );
+        assert_eq!(
+            ids(first().await.unwrap()),
+            [
+                "gpt-6-luna",
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
+                "ft:gpt-4o:audio-lab:image"
+            ]
+        );
+        assert_eq!(
+            ids(fetch_models(Some("key-b".into()), &endpoint, &cache)
+                .await
+                .unwrap()),
+            ["o3"]
+        );
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn discovery_distinguishes_empty_errors_and_retries_failures() {
+        let (endpoint, requests, task) = server(|request| {
+            if request.contains("Bearer bad") {
+                (401, "{}".into())
+            } else if request.contains("Bearer rate") {
+                (429, "{}".into())
+            } else if request.contains("Bearer malformed") {
+                (200, "not json".into())
+            } else {
+                (200, r#"{"data":[]}"#.into())
+            }
+        })
+        .await;
+        let cache = ModelCache::new();
+        assert!(fetch_models(None, &endpoint, &cache)
+            .await
+            .unwrap_err()
+            .contains("Enter"));
+        assert!(fetch_models(Some("bad\nkey".into()), &endpoint, &cache)
+            .await
+            .unwrap_err()
+            .contains("invalid characters"));
+        assert!(fetch_models(Some("bad".into()), &endpoint, &cache)
+            .await
+            .unwrap_err()
+            .contains("rejected"));
+        assert!(fetch_models(Some("rate".into()), &endpoint, &cache)
+            .await
+            .unwrap_err()
+            .contains("HTTP 429"));
+        assert!(fetch_models(Some("rate".into()), &endpoint, &cache)
+            .await
+            .is_err());
+        assert!(fetch_models(Some("malformed".into()), &endpoint, &cache)
+            .await
+            .unwrap_err()
+            .contains("invalid model list"));
+        assert!(fetch_models(Some("empty".into()), &endpoint, &cache)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(fetch_models(Some("empty".into()), &endpoint, &cache)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(requests.lock().unwrap().len(), 5);
+        task.abort();
+    }
+
+    #[test]
+    fn supports_existing_and_future_reasoning_ids() {
+        for id in [
+            "gpt-4",
+            "o1",
+            "o3",
+            "o4-mini",
+            "o5",
+            "ft:gpt-4o:team:custom",
+            "ft:gpt-4o:audio-lab:image",
+            "gpt-5-prototype",
+        ] {
+            assert!(is_chat_model(id), "{id}");
+        }
+        for id in [
+            "omni-moderation",
+            "o3-audio",
+            "gpt-4-instruct",
+            "text-embedding-3-small",
+            "ft:gpt-4o-audio-preview:org:custom",
+            "o1-pro",
+            "o1-pro-2025-03-19",
+            "o3-pro",
+            "o3-pro-2025-06-10",
+            "gpt-5-pro",
+            "gpt-5-pro-2025-10-06",
+            "gpt-5.2-pro-2025-12-11",
+            "gpt-5.4-pro-2026-03-05",
+            "gpt-5.5-pro-2026-04-23",
+            "o3-deep-research-2025-06-26",
+            "o4-mini-deep-research-2025-06-26",
+        ] {
+            assert!(!is_chat_model(id), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_reports_network_errors() {
+        let cache = ModelCache::new();
+        assert!(
+            fetch_models(Some("key".into()), "http://127.0.0.1:0/v1/models", &cache)
+                .await
+                .unwrap_err()
+                .contains("Could not reach")
+        );
     }
 }

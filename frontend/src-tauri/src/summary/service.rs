@@ -1,7 +1,7 @@
 use crate::database::repositories::{
     meeting::MeetingsRepository, setting::SettingsRepository, summary::SummaryProcessesRepository,
 };
-use crate::summary::llm_client::LLMProvider;
+use crate::summary::llm_client::{LLMProvider, REQUEST_TIMEOUT_DURATION};
 use crate::summary::language_detection::detect_summary_language;
 use crate::summary::metadata::read_detected_summary_language_from_metadata;
 use crate::summary::processor::{
@@ -179,6 +179,10 @@ fn extract_cached_english_markdown(
     expected_source: &SummaryCacheSource,
     requested_language: Option<&str>,
 ) -> Result<Option<String>, serde_json::Error> {
+    // ChatGPT cache entries are not bound to a specific signed-in account.
+    if expected_source.model_provider.eq_ignore_ascii_case("openai-chatgpt") {
+        return Ok(None);
+    }
     let requested_language = match normalise_summary_language_for_cache(requested_language) {
         Some(language) if language != "English" => language,
         _ => return Ok(None),
@@ -207,6 +211,17 @@ fn extract_cached_english_markdown(
         Ok(None)
     } else {
         Ok(Some(cache.markdown))
+    }
+}
+
+fn summary_http_client(provider: &LLMProvider) -> Result<reqwest::Client, reqwest::Error> {
+    if provider == &LLMProvider::OpenAiChatGpt {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(REQUEST_TIMEOUT_DURATION)
+            .build()
+    } else {
+        Ok(reqwest::Client::new())
     }
 }
 
@@ -344,6 +359,7 @@ impl SummaryService {
         custom_prompt: String,
         template_id: String,
         summary_language: Option<String>,
+        chatgpt_permit: Option<crate::chatgpt::session::SessionPermit>,
     ) {
         let start_time = Instant::now();
         info!(
@@ -360,8 +376,8 @@ impl SummaryService {
             }
         };
 
-        // Validate and setup api_key, Flexible for Ollama, BuiltInAI, and CustomOpenAI
-        let api_key = if provider == LLMProvider::Ollama || provider == LLMProvider::BuiltInAI || provider == LLMProvider::CustomOpenAI {
+        // Providers without a standard database API key use their own configuration.
+        let api_key = if provider == LLMProvider::Ollama || provider == LLMProvider::BuiltInAI || provider == LLMProvider::CustomOpenAI || provider == LLMProvider::OpenAiChatGpt {
             // These providers don't require API keys from the standard database column
             String::new()
         } else {
@@ -547,8 +563,14 @@ impl SummaryService {
             }),
         };
 
-        let client = reqwest::Client::new();
-        let result = generate_meeting_summary(
+        let client = match summary_http_client(&provider) {
+            Ok(client) => client,
+            Err(_) => {
+                Self::fail_and_cleanup(&pool, &meeting_id, started_at, "Could not initialize the ChatGPT connection.").await;
+                return;
+            }
+        };
+        let generation = generate_meeting_summary(
             &client,
             &provider,
             &model_name,
@@ -568,8 +590,17 @@ impl SummaryService {
             summary_language.as_deref(),
             detected_summary_language.as_deref(),
             cached_english.as_deref(),
-        )
-        .await;
+            chatgpt_permit.as_ref(),
+        );
+        let result = if let Some(permit) = chatgpt_permit.as_ref() {
+            tokio::select! {
+                biased;
+                _ = permit.cancellation_token().cancelled() => Err("ChatGPT connection or automatic summary consent changed. Check ChatGPT settings and reconnect if needed.".to_string()),
+                result = generation => result,
+            }
+        } else {
+            generation.await
+        };
 
         let duration = start_time.elapsed().as_secs_f64();
 
@@ -579,7 +610,7 @@ impl SummaryService {
                     "✓ Successfully processed {} chunks for meeting_id: {}. Duration: {:.2}s",
                     generated.successful_chunk_count, meeting_id, duration
                 );
-                let result_json = match build_summary_result_json(
+                let mut result_json = match build_summary_result_json(
                     &generated.final_markdown,
                     &generated.english_markdown,
                     cache_source,
@@ -594,6 +625,9 @@ impl SummaryService {
                         return;
                     }
                 };
+                if let Some(warning) = &generated.followup_warning {
+                    result_json["followup_warning"] = serde_json::json!(warning);
+                }
 
                 match SummaryProcessesRepository::update_process_completed(
                     &pool,
@@ -694,6 +728,34 @@ impl SummaryService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn chatgpt_summary_client_does_not_follow_transcript_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::timeout;
+
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = first.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            assert_ne!(stream.read(&mut buffer).await.unwrap(), 0);
+            stream.write_all(format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{second_addr}/receive\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+        });
+        let client = summary_http_client(&LLMProvider::OpenAiChatGpt).unwrap();
+        let response = timeout(Duration::from_secs(2), client.post(format!("http://{first_addr}/responses"))
+            .bearer_auth("synthetic-token")
+            .body("synthetic transcript")
+            .send()).await.unwrap().unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        server.await.unwrap();
+        assert!(timeout(Duration::from_millis(250), second.accept()).await.is_err());
+    }
 
     #[test]
     fn stale_cleanup_keeps_the_replacement_cancellation_token() {
@@ -862,6 +924,18 @@ mod tests {
             extract_cached_english_markdown(&raw, &source, Some("de")).unwrap(),
             Some("# Meeting\n## Points\nHello".to_string())
         );
+    }
+
+    #[test]
+    fn chatgpt_never_reuses_an_account_unbound_cache() {
+        let mut source = sample_cache_source();
+        source.model_provider = "openai-chatgpt".to_string();
+        let raw = build_summary_result_json(
+            "# Reunion\n## Points\nBonjour",
+            "# Meeting\n## Points\nHello",
+            source.clone(), Some("fr"), false, false,
+        ).unwrap().to_string();
+        assert_eq!(extract_cached_english_markdown(&raw, &source, Some("de")).unwrap(), None);
     }
 
     #[test]

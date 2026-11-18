@@ -34,7 +34,7 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
             ollamaEndpoint: data.ollamaEndpoint || 'default'
           });
           // Fetch API key if not included and provider requires it
-          if (data.provider !== 'ollama' && data.provider !== 'custom-openai' && !data.apiKey) {
+          if (data.provider !== 'ollama' && data.provider !== 'builtin-ai' && data.provider !== 'custom-openai' && data.provider !== 'openai-chatgpt' && !data.apiKey) {
             try {
               const apiKeyData = await invokeTauri('api_get_api_key', {
                 provider: data.provider
@@ -113,10 +113,10 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
         provider: configToSave.provider,
         model: configToSave.model,
         whisperModel: configToSave.whisperModel,
-        apiKey: configToSave.apiKey ?? null,
+        apiKey: configToSave.provider === 'openai-chatgpt' ? null : configToSave.apiKey ?? null,
         ollamaEndpoint: configToSave.ollamaEndpoint ?? null
       };
-      console.log('Saving model config with payload:', payload);
+      console.log('Saving model config:', { provider: payload.provider, model: payload.model });
 
       // Track model configuration change
       if (updatedConfig && (

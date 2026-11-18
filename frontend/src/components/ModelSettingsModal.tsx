@@ -4,6 +4,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
 import { useOllamaDownload } from '@/contexts/OllamaDownloadContext';
 import { BuiltInModelManager } from '@/components/BuiltInModelManager';
+import { ChatGptPlanSettings } from '@/components/ChatGptPlanSettings';
+import hostedModelCatalog from '@/constants/hostedModelCatalog.json';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useConfig } from '@/contexts/ConfigContext';
@@ -31,7 +33,7 @@ import { cn, isOllamaNotInstalledError } from '@/lib/utils';
 import { toast } from 'sonner';
 
 export interface ModelConfig {
-  provider: 'ollama' | 'groq' | 'claude' | 'openai' | 'openrouter' | 'builtin-ai' | 'custom-openai';
+  provider: 'ollama' | 'groq' | 'claude' | 'openai' | 'openai-chatgpt' | 'openrouter' | 'builtin-ai' | 'custom-openai';
   model: string;
   whisperModel: string;
   apiKey?: string | null;
@@ -74,26 +76,6 @@ interface GroqModel {
   owned_by?: string;
 }
 
-// Fallback models for when API fetch fails or no API key provided
-const OPENAI_FALLBACK_MODELS = [
-  'gpt-4o',
-  'gpt-4o-mini',
-  'gpt-4-turbo',
-  'gpt-4',
-  'gpt-3.5-turbo',
-  'o1',
-  'o1-mini',
-  'o3',
-  'o3-mini',
-];
-
-const CLAUDE_FALLBACK_MODELS = [
-  'claude-sonnet-4-5-20250929',
-  'claude-haiku-4-5-20251001',
-  'claude-opus-4-5-20251101',
-  'claude-3-5-sonnet-latest',
-];
-
 const GROQ_FALLBACK_MODELS = [
   'llama-3.3-70b-versatile',
   'llama-3.1-70b-versatile',
@@ -135,6 +117,8 @@ export function ModelSettingsModal({
   const [models, setModels] = useState<OllamaModel[]>([]);
   const [error, setError] = useState<string>('');
   const [apiKey, setApiKey] = useState<string | null>(modelConfig.apiKey || null);
+  const [apiKeyProvider, setApiKeyProvider] = useState(modelConfig.provider);
+  const [chatGptReady, setChatGptReady] = useState(false);
   const [showApiKey, setShowApiKey] = useState<boolean>(false);
   const [isApiKeyLocked, setIsApiKeyLocked] = useState<boolean>(!!modelConfig.apiKey?.trim());
   const [isLockButtonVibrating, setIsLockButtonVibrating] = useState<boolean>(false);
@@ -149,6 +133,9 @@ export function ModelSettingsModal({
   const [hasAutoFetched, setHasAutoFetched] = useState<boolean>(false);
   const hasSyncedFromParent = useRef<boolean>(false);
   const hasLoadedInitialConfig = useRef<boolean>(false);
+  const hasUserEdited = useRef(false);
+  const currentProvider = useRef(modelConfig.provider);
+  currentProvider.current = modelConfig.provider;
   const [autoGenerateEnabled, setAutoGenerateEnabled] = useState<boolean>(true); // Default to true
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [isEndpointSectionCollapsed, setIsEndpointSectionCollapsed] = useState<boolean>(true); // Collapsed by default
@@ -167,12 +154,11 @@ export function ModelSettingsModal({
   // Combobox state
   const [modelComboboxOpen, setModelComboboxOpen] = useState<boolean>(false);
 
-  // Dynamic model fetching state for OpenAI, Claude, and Groq
-  const [openaiModels, setOpenaiModels] = useState<string[]>([]);
-  const [claudeModels, setClaudeModels] = useState<string[]>([]);
+  // Account-discovered models are valid only for the provider and key that produced them.
+  const [hostedModels, setHostedModels] = useState<{
+    provider: 'openai' | 'claude'; key: string; models: string[]; status: 'loading' | 'verified' | 'error';
+  } | null>(null);
   const [groqModels, setGroqModels] = useState<string[]>([]);
-  const [isLoadingOpenAI, setIsLoadingOpenAI] = useState<boolean>(false);
-  const [isLoadingClaude, setIsLoadingClaude] = useState<boolean>(false);
   const [isLoadingGroq, setIsLoadingGroq] = useState<boolean>(false);
 
   // Use global download context instead of local state
@@ -232,11 +218,17 @@ export function ModelSettingsModal({
     }
   }, [apiKey]);
 
+  const activeHostedModels = hostedModels && hostedModels.provider === modelConfig.provider &&
+    apiKeyProvider === modelConfig.provider && hostedModels.key === (apiKey || '').trim()
+    ? hostedModels : null;
   const modelOptions: Record<string, string[]> = {
     ollama: models.map((model) => model.name),
-    claude: claudeModels.length > 0 ? claudeModels : CLAUDE_FALLBACK_MODELS,
+    claude: activeHostedModels?.status === 'verified' && activeHostedModels.provider === 'claude'
+      ? activeHostedModels.models : hostedModelCatalog.claude,
     groq: groqModels.length > 0 ? groqModels : GROQ_FALLBACK_MODELS,
-    openai: openaiModels.length > 0 ? openaiModels : OPENAI_FALLBACK_MODELS,
+    openai: activeHostedModels?.status === 'verified' && activeHostedModels.provider === 'openai'
+      ? activeHostedModels.models : hostedModelCatalog.openai,
+    'openai-chatgpt': [],
     openrouter: openRouterModels.map((m) => m.id),
     'builtin-ai': builtinAiModels.map((m) => m.name),
     'custom-openai': customOpenAIModel ? [customOpenAIModel] : [], // User specifies model manually
@@ -259,11 +251,18 @@ export function ModelSettingsModal({
   );
 
   const isDoneDisabled =
-    (requiresApiKey && (!apiKey || (typeof apiKey === 'string' && !apiKey.trim()))) ||
+    (requiresApiKey && (apiKeyProvider !== modelConfig.provider || !apiKey || !apiKey.trim())) ||
+    (modelConfig.provider === 'openai-chatgpt' && (!chatGptReady || !modelConfig.model)) ||
+    ((modelConfig.provider === 'openai' || modelConfig.provider === 'claude') && !modelConfig.model.trim()) ||
     (modelConfig.provider === 'ollama' && ollamaEndpointChanged) ||
     isCustomOpenAIInvalid;
 
   useEffect(() => {
+    if (modelConfig.provider !== 'openai-chatgpt') setChatGptReady(false);
+  }, [modelConfig.provider]);
+
+  useEffect(() => {
+    let current = true;
     const fetchModelConfig = async () => {
       // If parent component manages config, skip fetch and just mark as loaded
       if (skipInitialFetch) {
@@ -273,17 +272,21 @@ export function ModelSettingsModal({
 
       try {
         const data = (await invoke('api_get_model_config')) as any;
+        if (!current || hasUserEdited.current) return;
         if (data && data.provider !== null) {
+          currentProvider.current = data.provider;
           setModelConfig(data);
 
           // Fetch API key if not included in response and provider requires it
-          if (data.provider !== 'ollama' && !data.apiKey) {
+          if (data.provider !== 'ollama' && data.provider !== 'openai-chatgpt' && !data.apiKey) {
             try {
               const apiKeyData = await invoke('api_get_api_key', {
                 provider: data.provider
               }) as string;
-              data.apiKey = apiKeyData;
-              setApiKey(apiKeyData);
+              if (current && !hasUserEdited.current && currentProvider.current === data.provider) {
+                setApiKey(apiKeyData);
+                setApiKeyProvider(data.provider);
+              }
             } catch (err) {
               console.error('Failed to fetch API key:', err);
             }
@@ -300,7 +303,7 @@ export function ModelSettingsModal({
           if (data.provider === 'custom-openai') {
             try {
               const customConfig = (await invoke('api_get_custom_openai_config')) as any;
-              if (customConfig) {
+              if (current && !hasUserEdited.current && currentProvider.current === data.provider && customConfig) {
                 setCustomOpenAIEndpoint(customConfig.endpoint || '');
                 setCustomOpenAIModel(customConfig.model || '');
                 setCustomOpenAIApiKey(customConfig.apiKey || '');
@@ -320,6 +323,7 @@ export function ModelSettingsModal({
     };
 
     fetchModelConfig();
+    return () => { current = false; };
   }, [skipInitialFetch]);
 
   // Fetch auto-generate setting on mount
@@ -414,8 +418,9 @@ export function ModelSettingsModal({
   useEffect(() => {
     if (providerApiKeys && requiresApiKey && modelConfig.provider !== 'custom-openai') {
       const correctKey = providerApiKeys[modelConfig.provider as keyof typeof providerApiKeys];
-      if (correctKey !== apiKey) {
+      if (apiKeyProvider !== modelConfig.provider || correctKey !== apiKey) {
         setApiKey(correctKey || '');
+        setApiKeyProvider(modelConfig.provider);
         setIsApiKeyLocked(!!correctKey?.trim());
       }
     }
@@ -532,41 +537,21 @@ export function ModelSettingsModal({
     }
   };
 
-  // Fetch OpenAI models from API
-  const loadOpenAIModels = async (key: string | null) => {
-    if (!key?.trim()) {
-      setOpenaiModels([]); // Will use fallback via modelOptions
-      return;
-    }
-    setIsLoadingOpenAI(true);
-    try {
-      const data = (await invoke('get_openai_models', { apiKey: key })) as OpenAIModel[];
-      setOpenaiModels(data.map((m) => m.id));
-    } catch (err) {
-      console.error('Error loading OpenAI models:', err);
-      setOpenaiModels([]); // Will use fallback via modelOptions
-    } finally {
-      setIsLoadingOpenAI(false);
-    }
-  };
-
-  // Fetch Anthropic (Claude) models from API
-  const loadClaudeModels = async (key: string | null) => {
-    if (!key?.trim()) {
-      setClaudeModels([]); // Will use fallback via modelOptions
-      return;
-    }
-    setIsLoadingClaude(true);
-    try {
-      const data = (await invoke('get_anthropic_models', { apiKey: key })) as AnthropicModel[];
-      setClaudeModels(data.map((m) => m.id));
-    } catch (err) {
-      console.error('Error loading Claude models:', err);
-      setClaudeModels([]); // Will use fallback via modelOptions
-    } finally {
-      setIsLoadingClaude(false);
-    }
-  };
+  // Ignore old discovery responses after a provider or key change.
+  useEffect(() => {
+    const provider = modelConfig.provider;
+    const key = (apiKey || '').trim();
+    if ((provider !== 'openai' && provider !== 'claude') || apiKeyProvider !== provider || !key) return;
+    let current = true;
+    setHostedModels({ provider, key, models: [], status: 'loading' });
+    const command = provider === 'openai' ? 'get_openai_models' : 'get_anthropic_models';
+    invoke<(OpenAIModel | AnthropicModel)[]>(command, { apiKey: key }).then((data) => {
+      if (current) setHostedModels({ provider, key, models: data.map((item) => item.id), status: 'verified' });
+    }).catch(() => {
+      if (current) setHostedModels({ provider, key, models: [], status: 'error' });
+    });
+    return () => { current = false; };
+  }, [modelConfig.provider, apiKey, apiKeyProvider]);
 
   // Fetch Groq models from API
   const loadGroqModels = async (key: string | null) => {
@@ -586,20 +571,6 @@ export function ModelSettingsModal({
     }
   };
 
-  // Auto-fetch OpenAI models when provider is openai and we have an API key
-  useEffect(() => {
-    if (modelConfig.provider === 'openai' && apiKey?.trim()) {
-      loadOpenAIModels(apiKey);
-    }
-  }, [modelConfig.provider, apiKey]);
-
-  // Auto-fetch Claude models when provider is claude and we have an API key
-  useEffect(() => {
-    if (modelConfig.provider === 'claude' && apiKey?.trim()) {
-      loadClaudeModels(apiKey);
-    }
-  }, [modelConfig.provider, apiKey]);
-
   // Auto-fetch Groq models when provider is groq and we have an API key
   useEffect(() => {
     if (modelConfig.provider === 'groq' && apiKey?.trim()) {
@@ -609,6 +580,7 @@ export function ModelSettingsModal({
 
   // Restore cached model when async model lists become available
   useEffect(() => {
+    if (modelConfig.provider === 'openai' || modelConfig.provider === 'claude' || modelConfig.provider === 'openai-chatgpt') return;
     const providerModels = modelOptions[modelConfig.provider];
     if (!providerModels || providerModels.length === 0) return;
 
@@ -621,7 +593,7 @@ export function ModelSettingsModal({
     if (cachedModel && providerModels.includes(cachedModel)) {
       setModelConfig((prev: ModelConfig) => ({ ...prev, model: cachedModel }));
     }
-  }, [models, openRouterModels, builtinAiModels, openaiModels, claudeModels, groqModels, modelConfig.provider]);
+  }, [models, openRouterModels, builtinAiModels, groqModels, modelConfig.provider]);
 
   const handleSave = async () => {
     // For custom-openai provider, save the custom config first
@@ -645,7 +617,7 @@ export function ModelSettingsModal({
 
     const updatedConfig = {
       ...modelConfig,
-      apiKey: typeof apiKey === 'string' ? apiKey.trim() || null : null,
+      apiKey: modelConfig.provider === 'openai-chatgpt' ? null : typeof apiKey === 'string' ? apiKey.trim() || null : null,
       ollamaEndpoint: modelConfig.provider === 'ollama'
         ? (ollamaEndpoint.trim() || null)
         : (modelConfig.ollamaEndpoint || null),
@@ -660,7 +632,6 @@ export function ModelSettingsModal({
       model: modelConfig.provider === 'custom-openai' ? customOpenAIModel.trim() : modelConfig.model,
     };
     setModelConfig(updatedConfig);
-    console.log('ModelSettingsModal - handleSave - Updated ModelConfig:', updatedConfig);
 
     // Persist confirmed model choice to per-provider cache
     if (updatedConfig.model) {
@@ -824,6 +795,8 @@ export function ModelSettingsModal({
               value={modelConfig.provider}
               onValueChange={(value) => {
                 const provider = value as ModelConfig['provider'];
+                hasUserEdited.current = true;
+                currentProvider.current = provider;
 
                 // Clear error state when switching providers
                 setError('');
@@ -841,14 +814,23 @@ export function ModelSettingsModal({
                 const defaultModel = providerModels && providerModels.length > 0
                   ? providerModels[0]
                   : '';
-                const model = (savedModel && providerModels?.includes(savedModel))
+                const isHostedChoice = provider === 'openai' || provider === 'claude' || provider === 'openai-chatgpt';
+                const model = (savedModel && (isHostedChoice || providerModels?.includes(savedModel)))
                   ? savedModel
                   : defaultModel;
+
+                if (provider === 'openai-chatgpt') {
+                  setChatGptReady(false);
+                  setApiKey(null);
+                  setApiKeyProvider(provider);
+                  setCustomOpenAIApiKey('');
+                }
 
                 setModelConfig({
                   ...modelConfig,
                   provider,
                   model,
+                  ...(provider === 'openai-chatgpt' ? { apiKey: null, customOpenAIApiKey: null } : {}),
                 });
                 // API key is now synced automatically via useEffect watching providerApiKeys
 
@@ -884,16 +866,17 @@ export function ModelSettingsModal({
               </SelectTrigger>
               <SelectContent className="max-h-64 overflow-y-auto">
                 <SelectItem value="builtin-ai">Built-in AI (Offline, No API needed)</SelectItem>
-                <SelectItem value="claude">Claude</SelectItem>
+                <SelectItem value="claude">Anthropic API key</SelectItem>
                 <SelectItem value="custom-openai">Custom Server (OpenAI)</SelectItem>
                 <SelectItem value="groq">Groq</SelectItem>
                 <SelectItem value="ollama">Ollama</SelectItem>
-                <SelectItem value="openai">OpenAI</SelectItem>
+                <SelectItem value="openai">OpenAI API key</SelectItem>
+                <SelectItem value="openai-chatgpt">ChatGPT plan</SelectItem>
                 <SelectItem value="openrouter">OpenRouter</SelectItem>
               </SelectContent>
             </Select>
 
-            {modelConfig.provider !== 'builtin-ai' && modelConfig.provider !== 'custom-openai' && (
+            {modelConfig.provider !== 'builtin-ai' && modelConfig.provider !== 'custom-openai' && modelConfig.provider !== 'openai-chatgpt' && (
               <Popover open={modelComboboxOpen} onOpenChange={setModelComboboxOpen} modal={true}>
                 <PopoverTrigger asChild>
                   <Button
@@ -913,8 +896,7 @@ export function ModelSettingsModal({
                     <CommandInput placeholder="Search models..." />
                     <CommandList className="max-h-[300px]">
                       {(modelConfig.provider === 'openrouter' && isLoadingOpenRouter) ||
-                       (modelConfig.provider === 'openai' && isLoadingOpenAI) ||
-                       (modelConfig.provider === 'claude' && isLoadingClaude) ||
+                       ((modelConfig.provider === 'openai' || modelConfig.provider === 'claude') && activeHostedModels?.status === 'loading') ||
                        (modelConfig.provider === 'groq' && isLoadingGroq) ? (
                         <div className="py-6 text-center text-sm text-muted-foreground">
                           <RefreshCw className="mx-auto h-4 w-4 animate-spin mb-2" />
@@ -928,8 +910,9 @@ export function ModelSettingsModal({
                               <CommandItem
                                 key={model}
                                 value={model}
-                                onSelect={(currentValue) => {
-                                  setModelConfig((prev: ModelConfig) => ({ ...prev, model: currentValue }));
+                                onSelect={() => {
+                                  hasUserEdited.current = true;
+                                  setModelConfig((prev: ModelConfig) => ({ ...prev, model }));
                                   setModelComboboxOpen(false);
                                 }}
                               >
@@ -951,7 +934,33 @@ export function ModelSettingsModal({
               </Popover>
             )}
           </div>
+          {(modelConfig.provider === 'openai' || modelConfig.provider === 'claude') && (
+            <div className="mt-3 space-y-1">
+              <Label htmlFor="hosted-model-id">Exact model ID</Label>
+              <Input id="hosted-model-id" value={modelConfig.model} onChange={(event) => {
+                hasUserEdited.current = true;
+                setModelConfig((prev: ModelConfig) => ({ ...prev, model: event.target.value }));
+              }} placeholder="Enter an exact model ID" />
+              <p className="text-xs text-muted-foreground">
+                {activeHostedModels?.status === 'verified'
+                  ? 'Models in the selector were returned for this API key. You can also enter an exact ID.'
+                  : activeHostedModels?.status === 'loading'
+                    ? 'Checking models for this API key. Your selected ID is preserved.'
+                    : activeHostedModels?.status === 'error'
+                      ? 'Could not verify models for this API key. The selector shows unverified suggestions.'
+                      : 'The selector shows unverified suggestions. Enter an API key to check available models.'}
+              </p>
+            </div>
+          )}
         </div>
+
+        {modelConfig.provider === 'openai-chatgpt' && (
+          <ChatGptPlanSettings
+            model={modelConfig.model}
+            onModelChange={(model) => setModelConfig((prev: ModelConfig) => ({ ...prev, model }))}
+            onReadyChange={setChatGptReady}
+          />
+        )}
 
         {/* Custom OpenAI Configuration Section */}
         {modelConfig.provider === 'custom-openai' && (
@@ -1086,7 +1095,7 @@ export function ModelSettingsModal({
               <Input
                 type={showApiKey ? 'text' : 'password'}
                 value={apiKey || ''}
-                onChange={(e) => setApiKey(e.target.value)}
+                onChange={(e) => { hasUserEdited.current = true; setApiKey(e.target.value); }}
                 disabled={isApiKeyLocked}
                 placeholder="Enter your API key"
                 className="pr-24"

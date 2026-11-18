@@ -48,6 +48,14 @@ The supported application uses Tauri commands and events, not a separate FastAPI
 - Rust emits events through Tauri, and frontend listeners update React state. Check the current command arguments and event payloads before changing either side of the interface.
 - [SidebarProvider.tsx](../frontend/src/components/Sidebar/SidebarProvider.tsx) manages meeting navigation and summary polling, and uses the recording-state context. Preserve the existing state ownership rather than introducing a second source of truth.
 
+## Hosted Meeting Summaries
+
+The OpenAI and Anthropic API-key pickers share their suggested models between Settings and the meeting screen. Rust lists models with the active credential and follows Anthropic’s pagination. A restricted key can still select an exact model ID. [Suggested models](../frontend/src/constants/hostedModelCatalog.json) · [OpenAI discovery](../frontend/src-tauri/src/openai/openai.rs) · [Anthropic discovery](../frontend/src-tauri/src/anthropic/anthropic.rs)
+
+The ChatGPT plan connection has its own provider ID, `openai-chatgpt`. Rust opens the system browser, validates the sign-in response at a loopback callback, and protects the session on the device. The app uses the model ID selected from the signed-in account’s list. [Sign-in](../frontend/src-tauri/src/chatgpt/oauth.rs) · [Sessions](../frontend/src-tauri/src/chatgpt/session.rs) · [Protected storage](../frontend/src-tauri/src/chatgpt/storage.rs)
+
+For a plan summary, Rust sends transcript text and instructions to OpenAI’s Responses API with `stream: true` and `store: false`. Sapphire saves visible output locally after `response.completed`. The native summary command checks account-specific consent before an automatic request, and disconnecting clears that consent. [Response handling](../frontend/src-tauri/src/chatgpt/inference.rs) · [Summary commands](../frontend/src-tauri/src/summary/commands.rs)
+
 ## Audio Pipeline
 
 [pipeline.rs](../frontend/src-tauri/src/audio/pipeline.rs) receives asynchronous microphone and system-audio chunks, converts input to mono, resamples when necessary, and buffers samples for mixing.

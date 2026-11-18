@@ -16,7 +16,7 @@ afterAll(() => {
 
 mock.module('next/navigation', () => ({ usePathname: () => '/meeting-details', useRouter: () => ({}) }));
 mock.module('../../src/contexts/RecordingStateContext', () => ({ useRecordingState: () => ({ isRecording: false }) }));
-const notify = mock(() => {});
+const notify = mock((..._args: unknown[]) => {});
 mock.module('sonner', () => ({ toast: { info: notify, error: notify, success: notify, warning: notify } }));
 const trackCompletion = mock(async (..._args: Parameters<typeof originalAnalytics.default.trackSummaryGenerationCompleted>) => {});
 mock.module('../../src/lib/analytics', () => ({ default: {
@@ -25,12 +25,14 @@ mock.module('../../src/lib/analytics', () => ({ default: {
 } }));
 let startProcess: () => Promise<{ process_id: string }>;
 let getSummary: (meetingId: string) => Promise<SummaryProcessResponse>;
+let getChatgptStatus: () => Promise<{ connected: boolean; planEnabled: boolean; autoSummary: boolean }>;
 const invoke = mock(async (command: string, args?: Record<string, unknown>): Promise<unknown> => {
   if (command === 'api_get_meetings') return [];
   if (command === 'doodle_sync') return null;
   if (command === 'api_get_summary') return getSummary(args!.meetingId as string);
   if (command === 'api_get_meeting_transcripts') return { transcripts: [{ text: 'Meeting transcript', timestamp: '00:00' }], total_count: 1 };
   if (command === 'get_ollama_models') return [{ name: 'test' }];
+  if (command === 'chatgpt_status') return getChatgptStatus();
   if (command === 'api_process_transcript') return startProcess();
   if (command === 'api_cancel_summary') return { cancelled: true };
   throw new Error(`Unexpected command: ${command}`);
@@ -49,6 +51,8 @@ const response = (overrides: Partial<SummaryProcessResponse> = {}): SummaryProce
   data: null, error: null, meetingName: 'Meeting A', ...overrides,
 });
 let configuredModel = 'test';
+let configuredProvider: 'ollama' | 'openai-chatgpt' = 'ollama';
+let isAutoSummary = false;
 let state: ReturnType<typeof useSummaryGeneration>;
 function Status({ initialSummary, meetingId = 'meeting-a' }: {
   initialSummary: SummaryProcessResponse; meetingId?: string;
@@ -57,8 +61,8 @@ function Status({ initialSummary, meetingId = 'meeting-a' }: {
   const [title, updateMeetingTitle] = useState('Original title');
   state = useSummaryGeneration({
     meeting: { id: meetingId, created_at: '2026-09-01T00:00:00Z' },
-    transcripts: [], modelConfig: { provider: 'ollama', model: configuredModel, whisperModel: 'base' },
-    isModelConfigLoading: false, selectedTemplate: 'daily_standup',
+    transcripts: [], modelConfig: { provider: configuredProvider, model: configuredModel, whisperModel: 'base' },
+    isModelConfigLoading: false, isAutoSummary, selectedTemplate: 'daily_standup',
     setAiSummary, updateMeetingTitle, initialSummary,
   });
   return <output>{state.summaryStatus}:{state.summaryError}:{title}:{JSON.stringify(summary)}</output>;
@@ -77,8 +81,11 @@ beforeEach(() => {
   });
   renderer = undefined as unknown as ReactTestRenderer;
   configuredModel = 'test';
+  configuredProvider = 'ollama';
+  isAutoSummary = false;
   timers.clear(); notify.mockClear(); trackCompletion.mockClear(); invoke.mockClear();
   getSummary = async () => response();
+  getChatgptStatus = async () => ({ connected: true, planEnabled: true, autoSummary: true });
   startProcess = async () => ({ process_id: 'attempt-a' });
   globalThis.setInterval = ((callback: () => Promise<void>) => {
     const id = ++nextTimer; timers.set(id, callback); return id;
@@ -104,6 +111,98 @@ async function tick() {
 }
 
 describe('summary state restored when returning to a meeting', () => {
+  test('manual generation and regeneration send explicit manual origin', async () => {
+    configuredProvider = 'openai-chatgpt';
+    await show(response({ status: 'idle', start: null }));
+    await act(async () => state.handleGenerateSummary());
+    await act(async () => state.handleRegenerateSummary());
+    const calls = invoke.mock.calls.filter(([command]) => command === 'api_process_transcript');
+    expect(calls).toHaveLength(2);
+    expect(calls.map(([, args]) => args?.origin)).toEqual(['manual', 'manual']);
+    expect(invoke.mock.calls.filter(([command]) => command === 'chatgpt_status')).toHaveLength(0);
+  });
+
+  test.each([
+    [false, true, true, true],
+    [true, false, true, true],
+    [true, true, false, true],
+    [true, true, true, false],
+  ])('automatic ChatGPT generation requires global and subscription consent', async (globalEnabled, connected, planEnabled, autoSummary) => {
+    configuredProvider = 'openai-chatgpt';
+    isAutoSummary = globalEnabled;
+    getChatgptStatus = async () => ({ connected, planEnabled, autoSummary });
+    await show(response({ status: 'idle', start: null }));
+    await act(async () => state.handleGenerateSummary('', 'automatic'));
+    expect(invoke.mock.calls.filter(([command]) => command === 'api_process_transcript')).toHaveLength(0);
+    if (!globalEnabled) expect(state.summaryError).toBeNull();
+    else if (!connected || !planEnabled) expect(state.summaryError).toContain('not connected or authorized');
+    else expect(state.summaryError).toContain('Automatic ChatGPT summaries are off');
+  });
+
+  test('automatic ChatGPT generation sends automatic origin only after both permissions', async () => {
+    configuredProvider = 'openai-chatgpt';
+    isAutoSummary = true;
+    await show(response({ status: 'idle', start: null }));
+    await act(async () => state.handleGenerateSummary('', 'automatic'));
+    expect(invoke.mock.calls.find(([command]) => command === 'api_process_transcript')?.[1]?.origin).toBe('automatic');
+  });
+
+  test('automatic generation fails closed when the subscription status cannot be read', async () => {
+    configuredProvider = 'openai-chatgpt';
+    isAutoSummary = true;
+    getChatgptStatus = async () => { throw new Error('Status unavailable'); };
+    await show(response({ status: 'idle', start: null }));
+    await act(async () => state.handleGenerateSummary('', 'automatic'));
+    expect(invoke.mock.calls.filter(([command]) => command === 'api_process_transcript')).toHaveLength(0);
+    expect(state.summaryError).toContain('Could not check ChatGPT auto-summary permission');
+  });
+
+  test('turning off global auto-summary while checking status prevents generation', async () => {
+    configuredProvider = 'openai-chatgpt';
+    isAutoSummary = true;
+    let resolve!: (status: { connected: boolean; planEnabled: boolean; autoSummary: boolean }) => void;
+    getChatgptStatus = () => new Promise(done => { resolve = done; });
+    const initial = response({ status: 'idle', start: null });
+    await show(initial);
+    let generation!: Promise<void>;
+    await act(async () => { generation = state.handleGenerateSummary('', 'automatic'); });
+    isAutoSummary = false;
+    await show(initial);
+    await act(async () => { resolve({ connected: true, planEnabled: true, autoSummary: true }); await generation; });
+    expect(invoke.mock.calls.filter(([command]) => command === 'api_process_transcript')).toHaveLength(0);
+  });
+
+  test('leaving the meeting during the auto-summary permission check prevents generation', async () => {
+    configuredProvider = 'openai-chatgpt';
+    isAutoSummary = true;
+    let resolve!: (status: { connected: boolean; planEnabled: boolean; autoSummary: boolean }) => void;
+    getChatgptStatus = () => new Promise(done => { resolve = done; });
+    await show(response({ status: 'idle', start: null }));
+    let generation!: Promise<void>;
+    await act(async () => { generation = state.handleGenerateSummary('', 'automatic'); });
+    await show(null);
+    await act(async () => { resolve({ connected: true, planEnabled: true, autoSummary: true }); await generation; });
+    expect(invoke.mock.calls.filter(([command]) => command === 'api_process_transcript')).toHaveLength(0);
+  });
+
+  test('reports plan usage recovery for a native string error', async () => {
+    configuredProvider = 'openai-chatgpt';
+    startProcess = async () => { throw 'ChatGPT request failed; code: subscription_sharing_usage_limit_exceeded'; };
+    await show(response({ status: 'idle', start: null }));
+    await act(async () => state.handleGenerateSummary());
+    expect(state.summaryError).toContain('usage limit has been reached');
+    expect(state.summaryError).toContain('Manage usage');
+  });
+
+  test('reports an uncoded ChatGPT rate limit without claiming plan quota exhaustion', async () => {
+    configuredProvider = 'openai-chatgpt';
+    startProcess = async () => { throw 'ChatGPT request failed (HTTP 429)'; };
+    await show(response({ status: 'idle', start: null }));
+    await act(async () => state.handleGenerateSummary());
+    expect(state.summaryError).toContain('rate limiting');
+    expect(state.summaryError).not.toContain('usage limit has been reached');
+  });
+
   test('repeated recovery read failures end regeneration and retain visible notes', async () => {
     await show(response({ data: { markdown: 'Previous summary' } }));
     getSummary = async () => { throw new Error('Database unavailable'); };
@@ -263,6 +362,35 @@ describe('summary state restored when returning to a meeting', () => {
     getSummary = async () => response({ status: 'completed', data: { markdown: 'Finished summary' } });
     await tick();
     expect(trackCompletion.mock.calls[0]?.slice(0, 3)).toEqual(['ollama', 'test', true]);
+  });
+
+  test.each([
+    {
+      warning: 'Translation to Spanish failed: ChatGPT request failed (HTTP 429); code: subscription_sharing_usage_limit_exceeded',
+      stage: 'Translation to Spanish failed',
+      recovery: 'usage limit has been reached',
+      encoded: false,
+    },
+    {
+      warning: 'English normalization failed: ChatGPT request failed; code: invalid_grant. Reconnect the account.',
+      stage: 'English normalization failed',
+      recovery: 'Reconnect the account',
+      encoded: true,
+    },
+  ])('keeps completed output and warns about a failed follow-up request', async ({ warning, stage, recovery, encoded }) => {
+    configuredProvider = 'openai-chatgpt';
+    await show(response({ status: 'idle', start: null }));
+    await act(async () => state.handleGenerateSummary());
+    const data = { markdown: 'Available summary', followup_warning: warning };
+    getSummary = async () => response({ status: 'completed', data: encoded ? JSON.stringify(data) : data });
+    await tick();
+    expect(state.summaryStatus).toBe('completed');
+    expect(text()).toContain('Available summary');
+    const notice = notify.mock.calls.find(([message]) => message === 'Summary generated with fallback');
+    expect(JSON.stringify(notice)).toContain('The available summary was kept');
+    expect(JSON.stringify(notice)).toContain(stage);
+    expect(JSON.stringify(notice)).toContain(recovery);
+    expect(trackCompletion.mock.calls[0]?.[4]).toBe('fallback');
   });
 
   test('old in-flight poll cannot stop a resumed poll for the same process', async () => {

@@ -381,6 +381,15 @@ The application will be built with Metal GPU acceleration automatically.
 - **pnpm:** Install version 9.15.9 with `npm install -g pnpm@9.15.9`.
 - **Visual Studio Build Tools:** Install the "Desktop development with C++" workload from the Visual Studio Installer.
 - **CMake:** Download and install from [cmake.org](https://cmake.org/download/).
+- The native speech dependencies also use `libclang.dll`. If bindgen cannot find it, set `LIBCLANG_PATH` in your build shell to the directory containing that DLL. [LLVM releases](https://github.com/llvm/llvm-project/releases)
+
+On Windows x64, if the pinned ONNX Runtime download returns HTTP 404, the same verified files are available in Microsoft's [Microsoft.ML.OnnxRuntime 1.22.0 package](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime/1.22.0). Open the downloaded `.nupkg` as a ZIP archive. Create `frontend/src-tauri/binaries/onnxruntime/` in your checkout and copy these three files there. The next build checks the size and SHA-256 of each file before using it.
+
+| File inside the package | Name in the destination directory |
+| --- | --- |
+| `runtimes/win-x64/native/onnxruntime.dll` | `onnxruntime.dll` |
+| `runtimes/win-x64/native/onnxruntime_providers_shared.dll` | `onnxruntime_providers_shared.dll` |
+| `LICENSE` | `onnxruntime-LICENSE.txt` |
 
 ### 2. Build and Run
 

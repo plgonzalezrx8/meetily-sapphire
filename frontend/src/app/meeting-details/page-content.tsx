@@ -71,7 +71,7 @@ export default function PageContent({
   const { serverAddress } = useSidebar();
 
   // Get model config from ConfigContext
-  const { modelConfig, setModelConfig, isModelConfigLoading } = useConfig();
+  const { modelConfig, setModelConfig, isModelConfigLoading, isAutoSummary } = useConfig();
 
   // Custom hooks
   const meetingData = useMeetingData({ meeting, summaryData, onMeetingUpdated });
@@ -97,17 +97,20 @@ export default function PageContent({
   const handleSaveModelConfig = async (config?: ModelConfig) => {
     if (!config) return;
     try {
+      const savedConfig = config.provider === 'openai-chatgpt'
+        ? { ...config, apiKey: null, customOpenAIApiKey: null }
+        : config;
       await invoke('api_save_model_config', {
-        provider: config.provider,
-        model: config.model,
-        whisperModel: config.whisperModel,
-        apiKey: config.apiKey ?? null,
-        ollamaEndpoint: config.ollamaEndpoint ?? null,
+        provider: savedConfig.provider,
+        model: savedConfig.model,
+        whisperModel: savedConfig.whisperModel,
+        apiKey: savedConfig.apiKey ?? null,
+        ollamaEndpoint: savedConfig.ollamaEndpoint ?? null,
       });
 
       // Emit event so ConfigContext and other listeners stay in sync
       const { emit } = await import('@tauri-apps/api/event');
-      await emit('model-config-updated', config);
+      await emit('model-config-updated', savedConfig);
 
       toast.success('Model settings saved successfully');
     } catch (error) {
@@ -122,6 +125,7 @@ export default function PageContent({
     transcripts: meetingData.transcripts,
     modelConfig: modelConfig,
     isModelConfigLoading,
+    isAutoSummary,
     selectedTemplate: templates.selectedTemplate,
     onMeetingUpdated,
     updateMeetingTitle: meetingData.updateMeetingTitle,
@@ -161,6 +165,7 @@ export default function PageContent({
   useEffect(() => {
     if (
       !shouldAutoGenerate
+      || !isAutoSummary
       || summaryGeneration.summaryStatus !== 'idle'
       || isModelConfigLoading
       || meetingData.transcripts.length === 0
@@ -172,9 +177,10 @@ export default function PageContent({
     autoGenerationStartedMeetingIdRef.current = meeting.id;
     console.log(`🤖 Auto-generating summary with ${modelConfig.provider}/${modelConfig.model}...`);
     onAutoGenerateComplete?.();
-    void summaryGeneration.handleGenerateSummary('');
+    void summaryGeneration.handleGenerateSummary('', 'automatic');
   }, [
     shouldAutoGenerate,
+    isAutoSummary,
     meeting.id,
     meetingData.transcripts.length,
     isModelConfigLoading,
