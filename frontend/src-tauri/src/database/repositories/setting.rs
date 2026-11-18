@@ -86,6 +86,9 @@ impl SettingsRepository {
             "groq" => "groqApiKey",
             "openrouter" => "openRouterApiKey",
             "builtin-ai" => return Ok(()), // No API key needed
+            "openai-chatgpt" => return Err(sqlx::Error::Protocol(
+                "ChatGPT uses its own sign-in and does not accept API keys".into(),
+            )),
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -93,16 +96,25 @@ impl SettingsRepository {
             }
         };
 
+        let initial_provider = if provider == "claude" { "claude" } else { "openai" };
+        let initial_model = crate::provider_catalog::recommended_models(initial_provider)
+            .first()
+            .ok_or_else(|| sqlx::Error::Protocol("Hosted model catalog is empty".into()))?;
         let query = format!(
             r#"
             INSERT INTO settings (id, provider, model, whisperModel, "{}")
-            VALUES ('1', 'openai', 'gpt-4o-2024-11-20', 'large-v3', $1)
+            VALUES ('1', $1, $2, 'large-v3', $3)
             ON CONFLICT(id) DO UPDATE SET
-                "{}" = $1
+                "{}" = $3
             "#,
             api_key_column, api_key_column
         );
-        sqlx::query(&query).bind(api_key).execute(pool).await?;
+        sqlx::query(&query)
+            .bind(initial_provider)
+            .bind(initial_model)
+            .bind(api_key)
+            .execute(pool)
+            .await?;
 
         Ok(())
     }
@@ -123,7 +135,7 @@ impl SettingsRepository {
             "groq" => "groqApiKey",
             "claude" => "anthropicApiKey",
             "openrouter" => "openRouterApiKey",
-            "builtin-ai" => return Ok(None), // No API key needed
+            "builtin-ai" | "openai-chatgpt" => return Ok(None), // No database API key
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -249,7 +261,7 @@ impl SettingsRepository {
             "groq" => "groqApiKey",
             "claude" => "anthropicApiKey",
             "openrouter" => "openRouterApiKey",
-            "builtin-ai" => return Ok(()), // No API key needed
+            "builtin-ai" | "openai-chatgpt" => return Ok(()), // No database API key
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -344,5 +356,50 @@ impl SettingsRepository {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn settings_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE settings (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, whisperModel TEXT NOT NULL, ollamaEndpoint TEXT, openaiApiKey TEXT, anthropicApiKey TEXT)",
+        ).execute(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn first_api_key_uses_current_provider_default_without_changing_saved_selection() {
+        for provider in ["openai", "claude"] {
+            let pool = settings_pool().await;
+            SettingsRepository::save_api_key(&pool, provider, "test-key").await.unwrap();
+            let initial: (String, String) = sqlx::query_as("SELECT provider, model FROM settings WHERE id = '1'")
+                .fetch_one(&pool).await.unwrap();
+            assert_eq!(initial.0, provider);
+            assert_eq!(initial.1, crate::provider_catalog::recommended_models(provider)[0]);
+            assert_eq!(SettingsRepository::get_api_key(&pool, provider).await.unwrap().as_deref(), Some("test-key"));
+
+            SettingsRepository::save_model_config(&pool, "ollama", "chosen-model", "large-v3", None).await.unwrap();
+            SettingsRepository::save_api_key(&pool, provider, "replacement-key").await.unwrap();
+            let saved: (String, String) = sqlx::query_as("SELECT provider, model FROM settings WHERE id = '1'")
+                .fetch_one(&pool).await.unwrap();
+            assert_eq!(saved, ("ollama".to_string(), "chosen-model".to_string()));
+            assert_eq!(SettingsRepository::get_api_key(&pool, provider).await.unwrap().as_deref(), Some("replacement-key"));
+        }
+    }
+
+    #[tokio::test]
+    async fn chatgpt_config_has_no_database_api_key() {
+        let pool = settings_pool().await;
+        SettingsRepository::save_model_config(&pool, "openai-chatgpt", "model", "large-v3", None).await.unwrap();
+        assert_eq!(SettingsRepository::get_api_key(&pool, "openai-chatgpt").await.unwrap(), None);
+        assert!(SettingsRepository::save_api_key(&pool, "openai-chatgpt", "synthetic-token").await.is_err());
+        let keys: (Option<String>, Option<String>) = sqlx::query_as("SELECT openaiApiKey, anthropicApiKey FROM settings WHERE id = '1'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(keys, (None, None));
     }
 }

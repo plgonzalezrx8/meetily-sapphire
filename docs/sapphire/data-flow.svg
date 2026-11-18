@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 995" role="img" aria-labelledby="title desc">
+  <title id="title">From meeting audio to a summary</title>
+  <desc id="desc">Meeting audio is transcribed on the device. The transcript and prompt go to either a local model or a selected cloud provider. Cloud choices include OpenAI by API key or optional ChatGPT sign-in and Anthropic by API key.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#0b1934"/><stop offset="1" stop-color="#142d54"/></linearGradient>
+    <linearGradient id="gem" x2="1" y2="1"><stop stop-color="#a7e9ff"/><stop offset=".48" stop-color="#3599e6"/><stop offset="1" stop-color="#2140a9"/></linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#80c8f4"/></marker>
+  </defs>
+  <rect width="480" height="995" rx="24" fill="url(#bg)"/>
+  <g font-family="system-ui, -apple-system, Segoe UI, sans-serif" fill="#f5fbff">
+    <text x="28" y="43" font-size="18" font-weight="700" letter-spacing="1">MEETILY SAPPHIRE</text>
+    <text x="28" y="85" font-size="27" font-weight="700">Your meeting, your model</text>
+    <text x="28" y="115" font-size="18" fill="#c4d9e9">Choose where summaries run.</text>
+    <path d="M411 27l25 13 4 22-29 27-29-27 4-22z" fill="url(#gem)" stroke="#b3eaff" stroke-width="2"/>
+    <path d="M386 40h50M411 27l-12 13 12 49 12-49-12-13M382 62h58M399 40l-17 22M423 40l17 22" fill="none" stroke="#d6f6ff" stroke-opacity=".65" stroke-width="1.5"/>
+    <rect x="28" y="145" width="424" height="92" rx="13" fill="#203b61" stroke="#4b7296"/>
+    <text x="48" y="181" font-size="22" font-weight="700">Meeting audio</text>
+    <text x="48" y="211" font-size="18" fill="#d0e4f1">Microphone and system audio</text>
+    <path d="M240 237v28" stroke="#80c8f4" stroke-width="3" marker-end="url(#arrow)"/>
+    <rect x="28" y="277" width="424" height="105" rx="13" fill="#183f62" stroke="#6ebfe8"/>
+    <text x="48" y="313" font-size="22" font-weight="700">On-device transcription</text>
+    <text x="48" y="343" font-size="18" fill="#d0e4f1">Whisper or Parakeet</text>
+    <text x="48" y="368" font-size="18" fill="#d0e4f1">turns speech into text</text>
+    <path d="M240 382v13H46v286" fill="none" stroke="#80c8f4" stroke-width="3"/>
+    <text x="68" y="425" font-size="18" font-weight="700" fill="#d0e4f1">Transcript + prompt</text>
+    <path d="M46 470h26" stroke="#80c8f4" stroke-width="3" marker-end="url(#arrow)"/>
+    <rect x="80" y="442" width="372" height="190" rx="13" fill="#163a53" stroke="#78cbdc"/>
+    <text x="100" y="480" font-size="22" font-weight="700">Local summary</text>
+    <text x="100" y="513" font-size="18" fill="#d0e4f1">Built-in AI or Ollama</text>
+    <text x="100" y="540" font-size="18" fill="#d0e4f1">on your device</text>
+    <text x="100" y="583" font-size="18" fill="#b7d5e4">Check your Ollama endpoint</text>
+    <text x="100" y="608" font-size="18" fill="#b7d5e4">if you configure your own.</text>
+    <path d="M46 681h26" stroke="#80c8f4" stroke-width="3" marker-end="url(#arrow)"/>
+    <rect x="80" y="653" width="372" height="218" rx="13" fill="#253c65" stroke="#8ab9ee"/>
+    <text x="100" y="691" font-size="22" font-weight="700">Cloud summary</text>
+    <text x="100" y="725" font-size="18" fill="#d0e4f1">OpenAI API key</text>
+    <text x="100" y="754" font-size="18" fill="#d0e4f1">ChatGPT sign-in, opt-in</text>
+    <text x="100" y="783" font-size="18" fill="#d0e4f1">Anthropic API key</text>
+    <text x="100" y="830" font-size="18" fill="#b7d5e4">Text goes to your chosen</text>
+    <text x="100" y="855" font-size="18" fill="#b7d5e4">provider.</text>
+    <text x="28" y="927" font-size="18" fill="#c4d9e9">Recordings, transcripts, and summaries</text>
+    <text x="28" y="953" font-size="18" fill="#c4d9e9">are stored locally.</text>
+  </g>
+</svg>

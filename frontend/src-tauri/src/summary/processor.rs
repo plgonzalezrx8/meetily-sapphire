@@ -154,6 +154,29 @@ fn english_markdown_after_normalization_result(
     }
 }
 
+fn chatgpt_followup_result(
+    stage: &str,
+    original: &str,
+    result: Result<CleanedLlmMarkdown, String>,
+    summary_cancel: Option<&CancellationToken>,
+    session_cancel: Option<&CancellationToken>,
+) -> Result<(CleanedLlmMarkdown, Option<String>), String> {
+    let (warning, reasoning_stripped) = match result {
+        Ok(cleaned) if !cleaned.markdown.is_empty() => return Ok((cleaned, None)),
+        Ok(cleaned) => ("ChatGPT returned no visible text. Please retry.".to_string(), cleaned.reasoning_stripped),
+        Err(error) => (error, false),
+    };
+    if summary_cancel.is_some_and(CancellationToken::is_cancelled)
+        || session_cancel.map_or(true, CancellationToken::is_cancelled)
+    {
+        return Err(warning);
+    }
+    Ok((
+        CleanedLlmMarkdown { markdown: original.to_string(), reasoning_stripped },
+        Some(format!("{stage} failed: {warning}")),
+    ))
+}
+
 /// Maps a BCP-47 tag to the English language name used inside LLM prompts.
 ///
 /// LLMs respond far more reliably to "in Spanish" than to "in es". Regional
@@ -357,6 +380,7 @@ pub(crate) struct GeneratedMeetingSummary {
     pub successful_chunk_count: i64,
     pub reasoning_stripped: bool,
     pub normalization_fallback: bool,
+    pub followup_warning: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -380,6 +404,7 @@ pub(crate) async fn generate_meeting_summary(
     summary_language: Option<&str>,
     detected_transcript_language: Option<&str>,
     cached_english: Option<&str>,
+    chatgpt_permit: Option<&crate::chatgpt::session::SessionPermit>,
 ) -> Result<GeneratedMeetingSummary, String> {
     if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
         return Err("Summary generation was cancelled".to_string());
@@ -411,7 +436,7 @@ pub(crate) async fn generate_meeting_summary(
                         let result = match generate_summary(
                             client, provider, model_name, api_key, "You are an expert meeting summarizer.",
                             &prompt, ollama_endpoint, custom_openai_endpoint, max_tokens, temperature,
-                            top_p, app_data_dir, cancellation_token,
+                            top_p, app_data_dir, cancellation_token, chatgpt_permit,
                         )
                         .await
                         {
@@ -474,7 +499,7 @@ pub(crate) async fn generate_meeting_summary(
                         client, provider, model_name, api_key,
                         "You are an expert at synthesizing meeting summaries.", &prompt,
                         ollama_endpoint, custom_openai_endpoint, max_tokens, temperature, top_p,
-                        app_data_dir, cancellation_token,
+                        app_data_dir, cancellation_token, chatgpt_permit,
                     )
                     .await?;
                     let cleaned = clean_llm_markdown_detailed(&completion.content);
@@ -502,7 +527,7 @@ pub(crate) async fn generate_meeting_summary(
             let completion = generate_summary(
                 client, provider, model_name, api_key, &final_system_prompt, &final_user_prompt,
                 ollama_endpoint, custom_openai_endpoint, max_tokens, temperature, top_p,
-                app_data_dir, cancellation_token,
+                app_data_dir, cancellation_token, chatgpt_permit,
             )
             .await?;
             let cleaned = clean_llm_markdown_detailed(&completion.content);
@@ -511,30 +536,47 @@ pub(crate) async fn generate_meeting_summary(
             (cleaned.markdown, successful_chunk_count, stage_reasoning_stripped)
         };
 
+    let mut followup_warning = None;
     let (final_markdown, normalization_fallback) =
         match resolve_final_language_action(summary_language, detected_transcript_language) {
             FinalLanguageAction::Translate(language) => {
-                let translated = translate_markdown(
+                let result = translate_markdown(
                     client, provider, model_name, api_key, &english_markdown, language,
                     ollama_endpoint, custom_openai_endpoint, max_tokens, temperature, top_p,
-                    app_data_dir, cancellation_token,
+                    app_data_dir, cancellation_token, chatgpt_permit,
                 )
-                .await
-                .map_err(|error| format!("Translation to {language} failed: {error}"))?;
+                .await;
+                let translated = if provider == &LLMProvider::OpenAiChatGpt {
+                    let (translated, warning) = chatgpt_followup_result(
+                        &format!("Translation to {language}"), &english_markdown, result, cancellation_token,
+                        chatgpt_permit.map(|permit| permit.cancellation_token()),
+                    )?;
+                    followup_warning = warning;
+                    translated
+                } else {
+                    result.map_err(|error| format!("Translation to {language} failed: {error}"))?
+                };
                 reasoning_stripped |= translated.reasoning_stripped;
                 (translated.markdown, false)
             }
             FinalLanguageAction::NormalizeEnglish => {
-                let (normalized, fallback) = english_markdown_after_normalization_result(
-                    &english_markdown,
-                    normalize_markdown_to_english(
-                        client, provider, model_name, api_key, &english_markdown, ollama_endpoint,
-                        custom_openai_endpoint, max_tokens, temperature, top_p, app_data_dir,
-                        cancellation_token,
-                    )
-                    .await,
-                    cancellation_token,
-                )?;
+                let result = normalize_markdown_to_english(
+                    client, provider, model_name, api_key, &english_markdown, ollama_endpoint,
+                    custom_openai_endpoint, max_tokens, temperature, top_p, app_data_dir,
+                    cancellation_token, chatgpt_permit,
+                )
+                .await;
+                let (normalized, fallback) = if provider == &LLMProvider::OpenAiChatGpt {
+                    let (normalized, warning) = chatgpt_followup_result(
+                        "English normalization", &english_markdown, result, cancellation_token,
+                        chatgpt_permit.map(|permit| permit.cancellation_token()),
+                    )?;
+                    let fallback = warning.is_some();
+                    followup_warning = warning;
+                    (normalized, fallback)
+                } else {
+                    english_markdown_after_normalization_result(&english_markdown, result, cancellation_token)?
+                };
                 reasoning_stripped |= normalized.reasoning_stripped;
                 english_markdown = normalized.markdown.clone();
                 (normalized.markdown, fallback)
@@ -548,6 +590,7 @@ pub(crate) async fn generate_meeting_summary(
         successful_chunk_count,
         reasoning_stripped,
         normalization_fallback,
+        followup_warning,
     })
 }
 
@@ -567,6 +610,7 @@ async fn run_markdown_transform(
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
+    chatgpt_permit: Option<&crate::chatgpt::session::SessionPermit>,
 ) -> Result<CleanedLlmMarkdown, String> {
     if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
         return Err("Summary generation was cancelled".to_string());
@@ -574,6 +618,7 @@ async fn run_markdown_transform(
     let completion = generate_summary(
         client, provider, model_name, api_key, system_prompt, user_prompt, ollama_endpoint,
         custom_openai_endpoint, max_tokens, temperature, top_p, app_data_dir, cancellation_token,
+        chatgpt_permit,
     )
     .await
     .map_err(|error| format!("{failure_label} failed: {error}"))?;
@@ -597,6 +642,7 @@ async fn translate_markdown(
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
+    chatgpt_permit: Option<&crate::chatgpt::session::SessionPermit>,
 ) -> Result<CleanedLlmMarkdown, String> {
     let system_prompt = translation_system_prompt(target_language);
     let user_prompt = format!(
@@ -605,7 +651,7 @@ async fn translate_markdown(
     let cleaned = run_markdown_transform(
         client, provider, model_name, api_key, &system_prompt, &user_prompt, "Translation pass",
         ollama_endpoint, custom_openai_endpoint, max_tokens, temperature, top_p, app_data_dir,
-        cancellation_token,
+        cancellation_token, chatgpt_permit,
     )
     .await?;
     require_visible_markdown("Translation", &cleaned)?;
@@ -626,6 +672,7 @@ async fn normalize_markdown_to_english(
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
+    chatgpt_permit: Option<&crate::chatgpt::session::SessionPermit>,
 ) -> Result<CleanedLlmMarkdown, String> {
     let user_prompt = format!(
         "Convert the following Markdown document into English. Return ONLY the English Markdown, nothing else.\n\n<document>\n{markdown}\n</document>"
@@ -633,7 +680,7 @@ async fn normalize_markdown_to_english(
     run_markdown_transform(
         client, provider, model_name, api_key, english_normalization_system_prompt(), &user_prompt,
         "English normalization pass", ollama_endpoint, custom_openai_endpoint, max_tokens,
-        temperature, top_p, app_data_dir, cancellation_token,
+        temperature, top_p, app_data_dir, cancellation_token, chatgpt_permit,
     )
     .await
 }
@@ -641,6 +688,25 @@ async fn normalize_markdown_to_english(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chatgpt_followup_preserves_summary_and_actionable_warning_but_not_after_cancellation() {
+        let session = CancellationToken::new();
+        let quota_error = "subscription_sharing_usage_limit_exceeded: Open Manage usage";
+        let (retained, warning) = chatgpt_followup_result(
+            "Translation to French", "# Meeting\n## Notes\nVisible",
+            Err(quota_error.to_string()), None, Some(&session),
+        ).unwrap();
+        assert_eq!(retained.markdown, "# Meeting\n## Notes\nVisible");
+        assert_eq!(warning.as_deref(), Some("Translation to French failed: subscription_sharing_usage_limit_exceeded: Open Manage usage"));
+
+        let summary_cancel = CancellationToken::new();
+        summary_cancel.cancel();
+        assert!(chatgpt_followup_result("English normalization", "visible", Err("cancelled".into()), Some(&summary_cancel), Some(&session)).is_err());
+        session.cancel();
+        assert!(chatgpt_followup_result("English normalization", "visible", Err("disconnected".into()), None, Some(&session)).is_err());
+        assert!(chatgpt_followup_result("English normalization", "visible", Err("no permit".into()), None, None).is_err());
+    }
 
     #[test]
     fn chunk_text_preserves_content_after_early_sentence_boundary() {

@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use log::{info, warn};
 
-const REQUEST_TIMEOUT_DURATION: Duration = Duration::from_secs(300);
+pub(crate) const REQUEST_TIMEOUT_DURATION: Duration = Duration::from_secs(300);
 
 async fn await_or_cancel<T>(
     operation: impl Future<Output = T>,
@@ -214,6 +214,7 @@ pub(crate) fn ollama_rejects_reasoning_effort(status: reqwest::StatusCode, body:
 #[derive(Debug, Clone, PartialEq)]
 pub enum LLMProvider {
     OpenAI,
+    OpenAiChatGpt,
     Claude,
     Groq,
     Ollama,
@@ -227,6 +228,7 @@ impl LLMProvider {
     pub fn from_str(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
             "openai" => Ok(Self::OpenAI),
+            "openai-chatgpt" => Ok(Self::OpenAiChatGpt),
             "claude" => Ok(Self::Claude),
             "groq" => Ok(Self::Groq),
             "ollama" => Ok(Self::Ollama),
@@ -270,12 +272,29 @@ pub(crate) async fn generate_summary(
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
+    chatgpt_permit: Option<&crate::chatgpt::session::SessionPermit>,
 ) -> Result<LlmCompletion, String> {
     // Check if cancelled before starting
     if let Some(token) = cancellation_token {
         if token.is_cancelled() {
             return Err("Summary generation was cancelled".to_string());
         }
+    }
+
+    if provider == &LLMProvider::OpenAiChatGpt {
+        let permit = chatgpt_permit.ok_or_else(|| "ChatGPT session is not available".to_string())?;
+        let operation = async {
+            let bearer = crate::chatgpt::session::bearer(permit).await?;
+            crate::chatgpt::inference::complete(
+                client, &bearer, model_name, system_prompt, user_prompt, permit.cancellation_token(),
+            ).await
+        };
+        let content = tokio::select! {
+            biased;
+            _ = permit.cancellation_token().cancelled() => Err("ChatGPT connection or automatic summary consent changed. Check ChatGPT settings and reconnect if needed.".to_string()),
+            result = await_or_cancel(operation, cancellation_token) => result?,
+        }?;
+        return Ok(LlmCompletion { content, reasoning_stripped: false });
     }
 
     // Handle BuiltInAI provider separately (uses local sidecar, no HTTP API)
@@ -344,9 +363,8 @@ pub(crate) async fn generate_summary(
             );
             ("https://api.anthropic.com/v1/messages".to_string(), header_map)
         }
-        LLMProvider::BuiltInAI => {
-            // This case is handled earlier with early returns
-            unreachable!("BuiltInAI is handled before this match statement")
+        LLMProvider::BuiltInAI | LLMProvider::OpenAiChatGpt => {
+            unreachable!("Built-in and ChatGPT providers are handled before this match")
         }
     };
 
@@ -604,6 +622,41 @@ mod tests {
     }
 
     #[test]
+    fn provider_ids_and_existing_request_shapes_stay_separate() {
+        assert_eq!(LLMProvider::from_str("openai-chatgpt"), Ok(LLMProvider::OpenAiChatGpt));
+        assert_eq!(LLMProvider::from_str("openai"), Ok(LLMProvider::OpenAI));
+        assert_eq!(LLMProvider::from_str("claude"), Ok(LLMProvider::Claude));
+        for (provider, model) in [
+            (LLMProvider::OpenAI, "gpt-6-luna"),
+            (LLMProvider::OpenRouter, "deepseek/deepseek-chat"),
+            (LLMProvider::CustomOpenAI, "deepseek-chat"),
+        ] {
+            let body = build_openai_compat_chat_body(&provider, model, "instructions", "input", None, None, None);
+            assert_eq!(body["model"], model);
+            assert_eq!(body["messages"][0]["role"], "system");
+            assert_eq!(body["messages"][1]["content"], "input");
+            assert!(body.get("reasoning_effort").is_none());
+        }
+        let body = serde_json::to_value(ClaudeRequest {
+            model: "claude-sonnet-5-5".to_string(), max_tokens: 8192,
+            system: "instructions".to_string(),
+            messages: vec![ChatMessage { role: "user".to_string(), content: "input".to_string() }],
+        }).unwrap();
+        assert_eq!(body["model"], "claude-sonnet-5-5");
+        assert_eq!(body["system"], "instructions");
+        assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn chatgpt_cannot_generate_without_a_session_permit() {
+        let error = generate_summary(
+            &Client::new(), &LLMProvider::OpenAiChatGpt, "model", "", "system", "user",
+            None, None, None, None, None, None, None, None,
+        ).await.unwrap_err();
+        assert_eq!(error, "ChatGPT session is not available");
+    }
+
+    #[test]
     fn compatible_reasoning_is_separate_from_visible_content() {
         for message in [
             json!({"reasoning_content": "private"}),
@@ -694,6 +747,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("custom provider failure should preserve its response body");
@@ -778,6 +832,7 @@ mod tests {
             None,
             None,
             Some(&cancellation_token),
+            None,
         );
         tokio::pin!(generation);
 
@@ -864,6 +919,7 @@ mod tests {
             None,
             None,
             Some(&cancellation_token),
+            None,
         );
         tokio::pin!(generation);
 
@@ -942,6 +998,7 @@ mod tests {
                 None,
                 None,
                 Some(&cancellation_token),
+                None,
             ),
         )
         .await;
@@ -982,6 +1039,7 @@ mod tests {
 fn provider_name(provider: &LLMProvider) -> &str {
     match provider {
         LLMProvider::OpenAI => "OpenAI",
+        LLMProvider::OpenAiChatGpt => "ChatGPT",
         LLMProvider::Claude => "Claude",
         LLMProvider::Groq => "Groq",
         LLMProvider::Ollama => "Ollama",

@@ -9,6 +9,7 @@ import { SummaryUpdaterButtonGroup } from './SummaryUpdaterButtonGroup';
 import Analytics from '@/lib/analytics';
 import { useEffect, useRef, useState, RefObject } from 'react';
 import { toast } from 'sonner';
+import { invoke } from '@tauri-apps/api/core';
 import { Languages, ChevronDown } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
@@ -277,6 +278,19 @@ export function SummaryPanel({
             </div>
           )}
         </div>
+        {modelConfig.provider === 'openai-chatgpt' && (
+          <p className="mt-2 text-center text-xs text-gray-600">
+            Uses your ChatGPT plan. Limits apply.{' '}
+            <button
+              type="button"
+              className="text-blue-700 underline"
+              onClick={() => void invoke('open_external_url', { url: 'https://chatgpt.com/settings/usage' })
+                .catch(() => toast.error('Could not open ChatGPT usage settings'))}
+            >
+              Manage usage
+            </button>
+          </p>
+        )}
       </div>
 
       {isSummaryLoading ? (

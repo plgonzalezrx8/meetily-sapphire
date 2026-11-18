@@ -549,6 +549,9 @@ pub async fn api_save_model_config<R: Runtime>(
     ollama_endpoint: Option<String>,
     _auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    if provider == "openai-chatgpt" && api_key.as_deref().is_some_and(|key| !key.is_empty()) {
+        return Err("ChatGPT uses its own sign-in and does not accept API keys".to_string());
+    }
     log_info!(
         "Model config save requested; provider={}, model={}, whisper_model={}, endpoint_configured={}",
         provider,

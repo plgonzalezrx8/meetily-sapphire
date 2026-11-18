@@ -55,6 +55,23 @@ async function resolveSummaryLanguage(
 }
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
+type GenerationOrigin = 'manual' | 'automatic';
+
+function summaryErrorMessage(message: string): string {
+  if (message.includes('subscription_sharing_usage_limit_exceeded')) {
+    return 'Your ChatGPT plan usage limit has been reached. Check Manage usage or try again later.';
+  }
+  if (message.includes('subscription_sharing_user_not_eligible')) {
+    return 'This ChatGPT account is not eligible for plan use. Check your account or choose another summary provider.';
+  }
+  if (message.includes('subscription_sharing_usage_unavailable')) {
+    return 'ChatGPT plan usage is temporarily unavailable. Please try again later.';
+  }
+  if (message.includes('ChatGPT') && message.includes('(HTTP 429)')) {
+    return 'ChatGPT is rate limiting requests. Wait and retry, or check Manage usage for your plan limits.';
+  }
+  return message;
+}
 
 function restoredSummaryStatus(response?: SummaryProcessResponse | null): SummaryStatus {
   if (!response) return 'idle';
@@ -74,6 +91,7 @@ interface UseSummaryGenerationProps {
   transcripts: Transcript[];
   modelConfig: ModelConfig;
   isModelConfigLoading: boolean;
+  isAutoSummary?: boolean;
   selectedTemplate: string;
   onMeetingUpdated?: () => Promise<void>;
   updateMeetingTitle: (title: string) => void;
@@ -87,6 +105,7 @@ export function useSummaryGeneration({
   transcripts,
   modelConfig,
   isModelConfigLoading,
+  isAutoSummary = false,
   selectedTemplate,
   onMeetingUpdated,
   updateMeetingTitle,
@@ -97,12 +116,14 @@ export function useSummaryGeneration({
   const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>(() => restoredSummaryStatus(restored));
   const [summaryError, setSummaryError] = useState<string | null>(() =>
     restoredSummaryStatus(restored) === 'error'
-      ? restored?.error || 'Summary generation failed. Please retry.'
+      ? summaryErrorMessage(restored?.error || 'Summary generation failed. Please retry.')
       : null,
   );
   const mountedRef = useRef(true);
   const visibleMeetingIdRef = useRef(meeting.id);
   visibleMeetingIdRef.current = meeting.id;
+  const isAutoSummaryRef = useRef(isAutoSummary);
+  isAutoSummaryRef.current = isAutoSummary;
   const generationIdRef = useRef(0);
   const activeProcessIdRef = useRef<string | null>(null);
   const trackedAttemptRef = useRef<{
@@ -159,6 +180,7 @@ export function useSummaryGeneration({
       return;
     }
     activeProcessIdRef.current = null;
+    message = summaryErrorMessage(message);
     setSummaryError(message);
     setSummaryStatus('error');
     toast.error(`Failed to ${isRegeneration ? 'regenerate' : 'generate'} summary`, {
@@ -200,8 +222,8 @@ export function useSummaryGeneration({
     }
 
     if (pollingResult.status === 'error' || pollingResult.status === 'failed') {
-      const errorMessage = pollingResult.error
-        || `Summary ${isRegeneration ? 'regeneration' : 'generation'} failed`;
+      const errorMessage = summaryErrorMessage(pollingResult.error
+        || `Summary ${isRegeneration ? 'regeneration' : 'generation'} failed`);
       if (isRegeneration) {
         let existing: SummaryProcessResponse;
         try {
@@ -243,7 +265,7 @@ export function useSummaryGeneration({
         );
         return;
       }
-      const metadata = readSummaryMetadata(pollingResult.data);
+      const metadata = readSummaryMetadata(summary);
       const meetingName = metadata.meetingName || pollingResult.meetingName;
       if (meetingName) {
         updateMeetingTitle(meetingName);
@@ -252,7 +274,14 @@ export function useSummaryGeneration({
       setSummaryStatus('completed');
       activeProcessIdRef.current = null;
       setSummaryError(null);
-      if (metadata.normalizationFallback) {
+      if (metadata.followupWarning) {
+        const separator = metadata.followupWarning.indexOf(': ');
+        const stage = separator < 0 ? '' : metadata.followupWarning.slice(0, separator + 2);
+        const detail = separator < 0 ? metadata.followupWarning : metadata.followupWarning.slice(separator + 2);
+        toast.warning('Summary generated with fallback', {
+          description: `The available summary was kept. ${stage}${summaryErrorMessage(detail)}`,
+        });
+      } else if (metadata.normalizationFallback) {
         toast.warning('Summary generated with fallback', {
           description: 'English normalization failed, so the original sanitized summary was kept.',
         });
@@ -269,7 +298,7 @@ export function useSummaryGeneration({
       }
       await finishGeneration(
         generationId,
-        metadata.normalizationFallback ? 'fallback' : 'ok',
+        metadata.normalizationFallback || metadata.followupWarning ? 'fallback' : 'ok',
       );
     }
   }, [failGeneration, finishGeneration, meeting.id, onMeetingUpdated, setAiSummary, updateMeetingTitle]);
@@ -293,7 +322,7 @@ export function useSummaryGeneration({
     const status = restoredSummaryStatus(initialSummary);
     setSummaryStatus(status);
     setSummaryError(status === 'error'
-      ? initialSummary.error || 'Summary generation failed. Please retry.'
+      ? summaryErrorMessage(initialSummary.error || 'Summary generation failed. Please retry.')
       : null);
     if (status !== 'processing' || !initialSummary.start) return;
 
@@ -309,12 +338,15 @@ export function useSummaryGeneration({
     transcriptTexts,
     customPrompt = '',
     isRegeneration = false,
+    origin,
   }: {
     transcriptText: string;
     transcriptTexts?: string[];
     customPrompt?: string;
     isRegeneration?: boolean;
+    origin: GenerationOrigin;
   }) => {
+    if (!mountedRef.current || visibleMeetingIdRef.current !== meeting.id || (origin === 'automatic' && !isAutoSummaryRef.current)) return;
     const previousAttempt = trackedAttemptRef.current;
     if (previousAttempt && !previousAttempt.finished) {
       await finishGeneration(previousAttempt.generationId, 'cancelled');
@@ -360,6 +392,11 @@ export function useSummaryGeneration({
       if (!mountedRef.current || visibleMeetingIdRef.current !== meeting.id || generationId !== generationIdRef.current) {
         return;
       }
+      if (origin === 'automatic' && !isAutoSummaryRef.current) {
+        setSummaryStatus('idle');
+        await finishGeneration(generationId, 'cancelled');
+        return;
+      }
 
       const result = await invokeTauri<ProcessTranscriptResponse>('api_process_transcript', {
         text: transcriptText,
@@ -371,6 +408,7 @@ export function useSummaryGeneration({
         customPrompt,
         templateId: selectedTemplate,
         summaryLanguage,
+        origin,
       });
       const processId = result.process_id;
       if (!mountedRef.current || visibleMeetingIdRef.current !== meeting.id) return;
@@ -383,7 +421,8 @@ export function useSummaryGeneration({
       startSummaryPolling(meeting.id, processId, result =>
         pollingResultRef.current(result, generationId, isRegeneration));
     } catch (error) {
-      await failGeneration(generationId, isRegeneration, error instanceof Error ? error.message : 'Summary generation failed.');
+      await failGeneration(generationId, isRegeneration,
+        error instanceof Error ? error.message : typeof error === 'string' ? error : 'Summary generation failed.');
     }
   }, [
     failGeneration,
@@ -456,10 +495,32 @@ export function useSummaryGeneration({
     toast.error(message);
   }, []);
 
-  const handleGenerateSummary = useCallback(async (customPrompt: string = '') => {
+  const handleGenerateSummary = useCallback(async (customPrompt: string = '', origin: GenerationOrigin = 'manual') => {
     if (isModelConfigLoading) {
       toast.info('Loading model configuration, please wait...');
       return;
+    }
+    if (origin === 'automatic') {
+      if (!isAutoSummaryRef.current) return;
+      if (modelConfig.provider === 'openai-chatgpt') {
+        try {
+          const status = await invokeTauri<{ connected: boolean; planEnabled: boolean; autoSummary: boolean }>('chatgpt_status');
+          if (!mountedRef.current || visibleMeetingIdRef.current !== meeting.id || !isAutoSummaryRef.current) return;
+          if (!status.connected || !status.planEnabled) {
+            showPreflightError('ChatGPT plan access is not connected or authorized. Check AI Model settings or choose another provider.');
+            return;
+          }
+          if (!status.autoSummary) {
+            showPreflightError('Automatic ChatGPT summaries are off. Enable them in AI Model settings or generate manually.');
+            return;
+          }
+        } catch (error) {
+          if (!mountedRef.current || visibleMeetingIdRef.current !== meeting.id || !isAutoSummaryRef.current) return;
+          console.error('Could not check ChatGPT auto-summary permission:', error);
+          showPreflightError('Could not check ChatGPT auto-summary permission. Check model settings or generate manually.');
+          return;
+        }
+      }
     }
     const allTranscripts = await fetchAllTranscripts(meeting.id);
     if (!allTranscripts.length) {
@@ -502,6 +563,7 @@ export function useSummaryGeneration({
     await processSummary({
       ...buildSummaryTranscriptPayload(allTranscripts),
       customPrompt,
+      origin,
     });
   }, [
     buildSummaryTranscriptPayload,
@@ -526,7 +588,8 @@ export function useSummaryGeneration({
 
     await processSummary({
       ...buildSummaryTranscriptPayload(allTranscripts),
-      isRegeneration: true
+      isRegeneration: true,
+      origin: 'manual',
     });
   }, [meeting.id, fetchAllTranscripts, buildSummaryTranscriptPayload, processSummary]);
 

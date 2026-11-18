@@ -8,6 +8,7 @@ import { invoke } from '@tauri-apps/api/core';
 import Analytics from '@/lib/analytics';
 import { toast } from 'sonner';
 import { BetaFeatures, BetaFeatureKey, loadBetaFeatures, saveBetaFeatures } from '@/types/betaFeatures';
+import hostedModelCatalog from '@/constants/hostedModelCatalog.json';
 
 export interface OllamaModel {
   name: string;
@@ -333,7 +334,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
         setModelConfig(event.payload);
 
         // Update provider-specific key when config changes
-        if (event.payload.apiKey && event.payload.provider !== 'custom-openai') {
+        if (event.payload.apiKey && event.payload.provider !== 'custom-openai' && event.payload.provider !== 'openai-chatgpt') {
           updateProviderApiKey(event.payload.provider, event.payload.apiKey);
         }
       });
@@ -371,10 +372,11 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   // Calculate model options based on available models
   const modelOptions: Record<ModelConfig['provider'], string[]> = {
     ollama: models.map(model => model.name),
-    claude: ['claude-3-5-sonnet-latest'],
+    claude: hostedModelCatalog.claude,
     groq: ['llama-3.3-70b-versatile'],
     openrouter: [],
-    openai: ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'],
+    openai: hostedModelCatalog.openai,
+    'openai-chatgpt': [],
     'builtin-ai': [],
     'custom-openai': [],
   };

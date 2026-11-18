@@ -48,6 +48,8 @@ pub mod ollama;
 pub mod onboarding;
 pub mod openai;
 pub mod anthropic;
+mod chatgpt;
+mod provider_catalog;
 pub mod groq;
 pub mod openrouter;
 pub mod parakeet_engine;
@@ -585,13 +587,18 @@ pub fn run() {
                     .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
             let app_data_dir = _app.path().app_data_dir().ok();
-            match split_startup_logger(_app.handle(), app_data_dir, verbose) {
+            match split_startup_logger(_app.handle(), app_data_dir.clone(), verbose) {
                 Ok(((level, logger), persistent)) => {
                     if tauri_plugin_log::attach_logger(level, logger).is_err() || !persistent {
                         eprintln!("Meetily logging is unavailable or degraded.");
                     }
                 }
                 Err(_) => eprintln!("Meetily logging is unavailable or degraded."),
+            }
+            if let Some(directory) = app_data_dir {
+                if let Err(error) = chatgpt::session::initialize(directory) {
+                    log::warn!("ChatGPT connection is unavailable: {error}");
+                }
             }
 
             log::info!("Starting application...");
@@ -832,6 +839,12 @@ pub fn run() {
             ollama::get_ollama_model_context,
             openai::openai::get_openai_models,
             anthropic::anthropic::get_anthropic_models,
+            chatgpt::session::chatgpt_status,
+            chatgpt::session::chatgpt_connect,
+            chatgpt::session::chatgpt_cancel_connect,
+            chatgpt::session::chatgpt_disconnect,
+            chatgpt::session::chatgpt_set_auto_summary,
+            chatgpt::session::chatgpt_models,
             groq::groq::get_groq_models,
             api::api_get_meetings,
             api::api_search_transcripts,
