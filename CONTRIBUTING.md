@@ -29,13 +29,13 @@ Thank you for contributing to Meetily Sapphire! Current application work belongs
 
 - `Development` is the integration branch for feature work.
 - `main` is the release branch.
-- Create feature branches from `Development` and target `Development` for integration. It is currently local only, so integration happens through local merges until it is published. Do not target `main` for feature contributions.
+- Branch from the latest `Development` commit and open your feature PR against that branch. [Development branch](https://github.com/plgonzalezrx8/meetily-sapphire/tree/Development)
 
 ### Getting Started
 
-1. Fork and clone [Meetily Sapphire](https://github.com/plgonzalezrx8/meetily-sapphire).
-2. Use the maintained local `Development` branch as your base. While it is unpublished, coordinate access to that branch with the maintainers.
-3. Create a focused feature branch from `Development`.
+1. Clone [Meetily Sapphire](https://github.com/plgonzalezrx8/meetily-sapphire) or your fork of it.
+2. Fetch the integration branch with `git fetch https://github.com/plgonzalezrx8/meetily-sapphire.git Development`.
+3. Create your feature branch from that commit with `git switch -c my-feature FETCH_HEAD`.
 4. Follow the [build guide](docs/BUILDING.md), including the first-run sidecar setup.
 
 ### Development Process
@@ -58,7 +58,7 @@ For bugs, provide the app version, OS and architecture, installation method, rep
 
 ### Pull Request Process
 
-1. Integrate the focused feature branch into local `Development` through a local merge while that branch is unpublished. Once published, open a PR targeting `Development`.
+1. Open a PR from your feature branch into `plgonzalezrx8/meetily-sapphire:Development`.
 2. Link related issues or discussions when applicable. Link overlapping PRs and explain any distinct approach; do not create duplicate work silently.
 3. Complete the [PR template](.github/pull_request_template.md), including your duplicate search and verification results.
 4. Review your own changes, run relevant local checks, and report their results.
@@ -108,7 +108,7 @@ Types:
 ## Documentation
 
 - Update documentation for new features
-- Update the README in the same change when setup, features, or providers change. Once available, add links to the published `Development` branch and fork installers.
+- Update the README in the same PR when setup, features, or providers change. Add installer links when the fork publishes a release.
 - Document API changes
 - Add comments for complex code
 

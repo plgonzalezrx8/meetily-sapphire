@@ -4,15 +4,15 @@
 
 Meetily Sapphire is a free, open-source desktop meeting assistant. It records microphone and system audio, transcribes the conversation on your computer, and turns the transcript into meeting notes. You choose where the summary runs.
 
-In a sample planning meeting, Maya says, “Let’s ship the revised onboarding flow. I’ll have the rollout checklist ready by Friday.” A summary can capture both the decision and the commitment.
+These notes come from a fictional delivery meeting summarized on Windows with GPT-6-Luna through a connected ChatGPT plan.
 
-> **Decision** Ship the revised onboarding flow.
+> **Decision** Keep the fictional launch scheduled for Friday.
 >
-> **Action** Maya will prepare the rollout checklist by Friday.
+> **Action** Alex will update the checklist tomorrow.
 
 ## Build from source
 
-Build this fork from source. Follow the [build guide](docs/BUILDING.md) for platform prerequisites and the required `llama-helper` sidecar setup. Installing frontend dependencies does not stage the sidecar.
+Build from the fork’s `Development` branch to try the latest integrated features. Follow the platform prerequisites and prepare the `llama-helper` sidecar before starting the app. [Development branch](https://github.com/plgonzalezrx8/meetily-sapphire/tree/Development) · [Build guide](docs/BUILDING.md)
 
 Once the prerequisites and sidecar are ready, from `frontend/` run:
 
@@ -29,13 +29,23 @@ Use pnpm 9.15.9. For a production build, follow the release sidecar instructions
 
 Whisper and Parakeet transcribe audio on your device. Recordings, transcripts, and completed summaries are stored locally. For offline summaries, select a built-in model or a locally running Ollama model after downloading its weights.
 
-For hosted summaries, open **Settings → Summary Model Configuration**. The selected provider receives the transcript text and summary instructions.
+For hosted summaries, open **Settings → Summary** and find **Summary Model Configuration**. The selected provider receives the transcript text and summary instructions.
 
-- **OpenAI API key** uses your OpenAI API account. Pick a discovered model or enter its exact ID.
-- **ChatGPT plan** uses an eligible Plus or Pro account. Choose **Continue with ChatGPT** to see the models available to your account. Automatic summaries have a separate opt-in you can turn off. **Manage usage** opens your ChatGPT usage controls. Switching to API-key billing is a manual choice. [OpenAI’s plan usage guide](https://developers.openai.com/siwc/token-sharing-open-source)
-- **Anthropic API key** uses your Anthropic account. Pick a Claude model from your account catalog or enter its exact ID.
+- **OpenAI API key** uses your OpenAI API account. Sapphire suggests `gpt-6-luna` for everyday summaries and `gpt-6.2-sol` for difficult transcripts.
+- **ChatGPT plan** uses the allowance on an eligible ChatGPT account. OpenAI supplies its model list. **Manage usage** opens your ChatGPT usage controls. To switch to API billing, choose **OpenAI API key** explicitly. [OpenAI’s plan usage guide](https://developers.openai.com/siwc/token-sharing-open-source)
+- **Anthropic API key** uses your Anthropic account. Sapphire suggests `claude-sonnet-5-5` for quality and `claude-haiku-5-5` for lower cost.
+
+For either API key, the picker labels suggestions separately from models found for your account. If your key restricts model listing, enter the exact model ID. You can select a replacement when a saved model retires.
 
 Groq, OpenRouter, and custom OpenAI-compatible servers are also available. An Ollama or custom server can run on another machine, so its configured address determines where the transcript goes. [Audio and storage architecture](docs/architecture.md)
+
+### Generate a summary with your ChatGPT plan
+
+1. In **Settings → Summary**, select **ChatGPT plan**, read the privacy notice, and choose **Continue with ChatGPT**. Complete sign-in in your browser.
+2. Return to Sapphire. When you see **Connected**, choose a model from your account’s list and select **Save**.
+3. Open a meeting with a transcript and select **Generate Summary**. The completed notes appear beside the transcript and are saved on your computer.
+
+Automatic summaries start off for each connected account. To send transcripts automatically when meetings end, enable **Auto Summary** and **Allow automatic summaries using my ChatGPT plan**. You can turn this permission off or choose **Disconnect** in the same settings.
 
 ## Contributing
 
